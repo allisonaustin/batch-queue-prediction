@@ -1,4 +1,4 @@
-## Batch Scheduled Job Prediction
+## Batch-Scheduled Job Prediction
 
 A benchmarking and evaluation suite for evaluating tree-based models and deep tabular architectures on High-Performance Computing (HPC) batch job execution logs. This repository provides end-to-end pipelines for model training, threshold selection, feature importance extraction, and protocol evaluation under both random and temporal data split schemes. We also include analyses of submit-time vs. match-time feature matrices, hold reason codes, and exit code/signal evaluation. 
 
@@ -48,6 +48,13 @@ pip install torch numpy pandas scikit-learn xgboost lightgbm catboost pytorch-ta
 
 #### Dataset(s)
 TBD
+
+##### Structure
+- `Xmatch.npy` & `Xsub.npy`: feature matrices (match-time and submit-time features)
+- `failed.npy`: finary failure target labels 
+- `wait_sv.npy`: raw queue wait times in seconds
+- `tr_mask.npy` & `te_mask.npy`: train and test split marks (`tr` for random and `te` for temporal)
+- `targets_and_masks.npz`: aggregated dataset dictionary
 
 #### How to run
 All training and evaluation tasks are managed through the CLI in `scripts/eval/harness.py`:
