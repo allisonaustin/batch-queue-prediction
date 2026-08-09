@@ -1,0 +1,12 @@
+*.parquet
+*.pdf
+*.png
+data/
+.DS_Store
+results/
+models/
+old/
+dr_app/
+__pycache__/
+.ipynb_checkpoints/
+catboost_info/
