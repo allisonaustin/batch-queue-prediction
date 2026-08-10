@@ -1,4 +1,4 @@
-## Batch-Scheduled Job Prediction
+## Batch-Scheduled HEP Job Prediction
 
 A benchmarking and evaluation suite for evaluating tree-based models and deep tabular architectures on High-Performance Computing (HPC) batch job execution logs. This repository provides end-to-end pipelines for model training, threshold selection, feature importance extraction, and protocol evaluation under both random and temporal data split schemes. We also include analyses of submit-time vs. match-time feature matrices, hold reason codes, and exit code/signal evaluation.
 
@@ -9,6 +9,14 @@ A benchmarking and evaluation suite for evaluating tree-based models and deep ta
 3. Fault attribution (classification) at match-time (**E3**)
 
 ### Supported Models
+
+* XGBoost, LightGBM, CatBoost, MLP
+* TabNet
+* TabR
+* FT-Transformer
+* SAINT
+* Hierarchical NN
+* TSMixer
 
 ### Repo Structure
 
@@ -24,8 +32,8 @@ fife-batch-jobs/
 │   ├── data-explorer.ipynb  		# Job data visualizations
 │   ├── attribution-modeling.ipynb  # Job data analysis and prediction result visualizations
 ├── .gitignore                      # Dataset and runtime configuration
-├── CLAUDE.md                       # Global instructions for Claude                  
-├── FIFE-Docs.md                    # FIFE Batch Queue data documentation                  
+├── CLAUDE.md                       # Global instructions for Claude                
+├── FIFE-Docs.md                    # FIFE Batch Queue data documentation                
 ├── MODELING.md                     # Detailed modeling design notes
 ├── README.md                       # Repo info
 └── config.json						# Dataset and runtime configuration
@@ -53,7 +61,7 @@ TBD
 - `tr_mask.npy` & `te_mask.npy`: train and test split marks (`tr` for random and `te` for temporal)
 - `targets_and_masks.npz`: aggregated dataset dictionary
 
-#### How to run
+### How to run
 
 All training and evaluation tasks are managed through the CLI in `scripts/eval/harness.py`:
 
@@ -78,7 +86,7 @@ python scripts/eval/harness.py <experiment> <model> [split]
 python scripts/eval/harness.py e1 xgboost both
 ```
 
-#### Metrics
+### Metrics
 
 ##### Job failure classification/fault attribution
 
@@ -90,3 +98,5 @@ Precision, recall, F1, ROC-AUC, PR-AUC
 - raw MAE (s): ean absolute error converted back to raw seconds
 - sMAPE (%): symmetric mean absolute percentage error (bounded between $0\%$ and $200\%$)
 - within-2x ratio: proportion of predictions falling within a factor of 2 of actual wait times
+
+### References
