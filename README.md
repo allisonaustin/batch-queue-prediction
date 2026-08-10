@@ -14,10 +14,6 @@ A benchmarking and evaluation suite for evaluating tree-based models and deep ta
 
 ```
 fife-batch-jobs/
-├── config.json                     # Dataset and runtime configuration
-├── MODELING.md                     # Detailed modeling design notes
-├── README.md                       # Repo info
-├── CLAUDE.md                       # Global instructions for Claude                    
 ├── scripts/
 │   ├── vis/						# Data explorer visualization
 │   ├── eval/
@@ -27,7 +23,12 @@ fife-batch-jobs/
 │   ├── output/                     # Evaluation metrics and feature importance output JSONs
 │   ├── data-explorer.ipynb  		# Job data visualizations
 │   ├── attribution-modeling.ipynb  # Job data analysis and prediction result visualizations
-└── .gitignore
+├── .gitignore                      # Dataset and runtime configuration
+├── CLAUDE.md                       # Global instructions for Claude                  
+├── FIFE-Docs.md                    # FIFE Batch Queue data documentation                  
+├── MODELING.md                     # Detailed modeling design notes
+├── README.md                       # Repo info
+└── config.json						# Dataset and runtime configuration
 ```
 
 ### Requirements
