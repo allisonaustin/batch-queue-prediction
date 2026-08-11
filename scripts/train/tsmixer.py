@@ -226,7 +226,7 @@ def tsmixer_fit_eval(
 
     # Save trained model to disk
     os.makedirs(model_dir, exist_ok=True)
-    save_path = os.path.join(model_dir, f"tsmixer_{kind}_{exp_tag}_ {split}.pt")
+    save_path = os.path.join(model_dir, f"tsmixer_{kind}_{exp_tag}_{split}.pt")
     torch.save(model.state_dict(), save_path)
     print(f"    [TSMixer] Saved checkpoint to {save_path}", flush=True)
 

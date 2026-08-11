@@ -9,8 +9,9 @@ import pandas as pd
 import torch 
 import torch.nn as nn
 from sklearn.metrics import (
-    confusion_matrix, precision_recall_fscore_support, 
-    accuracy_score, roc_auc_score, average_precision_score, r2_score
+    confusion_matrix, precision_recall_fscore_support,
+    accuracy_score, roc_auc_score, average_precision_score, r2_score,
+    matthews_corrcoef
 )
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -68,16 +69,26 @@ def _get_slice(parts, idxs):
 
 
 # ---- Model Metric & Thresholding Helpers ----
-def pick_thr(y_true, y_prob):
-    """Find threshold that maximizes F1 score on validation set."""
+THR_GRID = np.linspace(0.05, 0.95, 91)
+
+
+def pick_thr(y_true, y_prob, target=1):
+    """Find the threshold on P(y=1) that maximizes F1 for class `target`.
+
+    A prediction is positive when `y_prob >= thr`, so raising the threshold trades
+    positive-class recall for precision and does the reverse for the negative class.
+    The two classes therefore peak at different cuts. `target=0` tunes for the
+    negative class's own F1, which is the operating point to use when that class
+    names a task of its own rather than "everything else".
+    """
     best_f1, best_thr = 0.0, 0.5
-    for thr in np.linspace(0.05, 0.95, 91):
+    for thr in THR_GRID:
         preds = (y_prob >= thr).astype(int)
         _, _, f1, _ = precision_recall_fscore_support(
-            y_true, preds, average="binary", zero_division=0
+            y_true, preds, average=None, labels=[0, 1], zero_division=0
         )
-        if f1 > best_f1:
-            best_f1, best_thr = f1, thr
+        if f1[target] > best_f1:
+            best_f1, best_thr = f1[target], thr
     return float(best_thr)
 
 
@@ -96,6 +107,96 @@ def cls_metrics(y_true, y_prob, thr=0.5):
         "f1": float(f1),
         "threshold": float(thr),
     }
+
+def cls_metrics_per_class(
+    y_true, y_prob, thr=0.5, thr_neg=None, pos_name="hardware", neg_name="payload"
+):
+    """Binary metrics split out per class, for tasks where both classes are of interest.
+
+    E3 asks two questions of one classifier -- "did we catch the hardware faults?"
+    and "did we catch the payload faults?" -- and a single positive-class row only
+    answers the first.
+
+    `thr` is the cut tuned for the positive class; `thr_neg`, when given, is the cut
+    tuned separately for the negative class. Each class block then reports its
+    threshold-dependent metrics at its *own* operating point, since the two tasks
+    peak at different cuts. Left as None, both classes are scored at `thr` and the
+    two blocks describe one shared decision rule.
+
+    The threshold-free metrics -- ROC AUC and each class's PR AUC -- are unaffected
+    by either choice, and are the fairer basis for comparing models.
+    """
+    y_true = np.asarray(y_true).astype(np.int8)
+    y_prob = np.asarray(y_prob, dtype=np.float64)
+    n = int(len(y_true))
+
+    def _prfs(t):
+        # index 0 -> negative class (neg_name), index 1 -> positive class (pos_name)
+        return precision_recall_fscore_support(
+            y_true, (y_prob >= t).astype(np.int8), average=None, labels=[0, 1],
+            zero_division=0,
+        )
+
+    pr, rc, f1, sup = _prfs(thr)
+    if thr_neg is None:
+        thr_neg = thr
+        pr_n, rc_n, f1_n = pr, rc, f1
+    else:
+        pr_n, rc_n, f1_n, _ = _prfs(thr_neg)
+
+    # ROC AUC is invariant under swapping which class is "positive", so one value
+    # describes the ranking for both. Average precision is not -- the negative
+    # class needs its own labels and scores inverted.
+    roc = float(roc_auc_score(y_true, y_prob))
+    ap_pos = float(average_precision_score(y_true, y_prob))
+    ap_neg = float(average_precision_score(1 - y_true, 1.0 - y_prob))
+
+    per_class = {
+        pos_name: {
+            "threshold": float(thr),
+            "pr_auc": ap_pos,
+            "precision": float(pr[1]),
+            "recall": float(rc[1]),
+            "f1": float(f1[1]),
+            "support": int(sup[1]),
+            "prevalence": float(sup[1] / n) if n else 0.0,
+        },
+        neg_name: {
+            "threshold": float(thr_neg),
+            "pr_auc": ap_neg,
+            "precision": float(pr_n[0]),
+            "recall": float(rc_n[0]),
+            "f1": float(f1_n[0]),
+            "support": int(sup[0]),
+            "prevalence": float(sup[0] / n) if n else 0.0,
+        },
+    }
+
+    return {
+        "roc_auc": roc,
+        # The remaining shared metrics describe the single decision rule at `thr`,
+        # the only one of the two cuts a deployed classifier could actually run.
+        "accuracy": float(accuracy_score(y_true, (y_prob >= thr).astype(np.int8))),
+        # MCC uses all four confusion-matrix cells and is symmetric between the two
+        # classes, so one value scores both tasks and a trivial majority-class
+        # classifier gets 0 rather than the ~0.9 accuracy flatters it with.
+        "mcc": float(matthews_corrcoef(y_true, (y_prob >= thr).astype(np.int8))),
+        "balanced_accuracy": float((rc[0] + rc[1]) / 2.0),
+        "macro_f1": float((f1[0] + f1[1]) / 2.0),
+        # Each task at its own best cut. Not reachable by one rule, so read it as a
+        # per-task ceiling rather than a deployable operating point.
+        "macro_f1_tuned": float((f1_n[0] + f1[1]) / 2.0),
+        "threshold": float(thr),
+        "n_test": n,
+        "positive_class": pos_name,
+        **per_class,
+        # Flat aliases for the positive class, matching the pre-split schema.
+        "pr_auc": ap_pos,
+        "precision": float(pr[1]),
+        "recall": float(rc[1]),
+        "f1": float(f1[1]),
+    }
+
 
 def reg_metrics(y_true_log, pred_log):
     """Computes honest wait time regression metrics on both log and original second scales."""
@@ -147,6 +248,39 @@ def thr_sample(a, max_n=500_000, seed=42):
     if len(a) > max_n:
         return np.random.default_rng(seed).choice(a, max_n, replace=False)
     return a
+
+
+VAL_FRAC = 0.10
+
+
+def holdout_split(tri, frac=VAL_FRAC, order=None, seed=42):
+    """Carve a threshold-selection slice out of the training indices.
+
+    The operating point has to be chosen on predictions the model has not fit, or
+    it inherits however much that model memorized its training rows -- a bias that
+    lands unevenly across model families and so distorts cross-model comparison.
+    The returned index arrays are disjoint: fit on the first, pick the cut on the
+    second.
+
+    `order` is a per-row sort key (queue-start time, for this dataset). Given one,
+    the slice is the most recent `frac` of the training window, so the validation
+    rows sit between the fitting rows and the test period exactly as the temporal
+    protocol intends. Without it the slice is drawn at random, which is the
+    matching choice for the random split protocol.
+    """
+    tri = np.asarray(tri)
+    n_val = int(round(frac * len(tri)))
+    if n_val < 1 or n_val >= len(tri):
+        raise ValueError(f"frac={frac} yields {n_val} validation rows from {len(tri)}")
+
+    if order is None:
+        cut = np.random.default_rng(seed).permutation(len(tri))
+    else:
+        # argpartition, not a full sort -- only the boundary position matters.
+        cut = np.argpartition(np.asarray(order)[tri], len(tri) - n_val)
+
+    # Sorted so downstream mmap slicing stays sequential.
+    return np.sort(tri[cut[:-n_val]]), np.sort(tri[cut[-n_val:]])
 
 
 def log_result(exp_name, model, split, **kwargs):
