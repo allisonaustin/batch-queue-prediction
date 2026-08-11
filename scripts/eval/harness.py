@@ -132,7 +132,7 @@ def fit_eval_binary(
 
         if split is not None:
             os.makedirs(model_dir, exist_ok=True)
-            save_path = os.path.join(model_dir, f"{lib}_bin_{split}.txt")
+            save_path = os.path.join(model_dir, f"{lib}_bin_{exp_tag}_{split}.txt")
             if lib in ("lightgbm", "lgb"):
                 m.booster_.save_model(save_path)
             elif lib in ("catboost", "cb"):
@@ -290,7 +290,8 @@ def run_e1_model(lib, Xm, yv, splits, imp_store, cm_store, ncat, order=None):
                 spw,
                 want_imp=True,
                 ncat=ncat,
-                split=split
+                split=split,
+                exp_tag="e1"
             )
             if imp is not None:
                 imp_store[(lib, split)] = imp
@@ -580,6 +581,28 @@ if __name__ == "__main__":
         f"Temporal ({len(tri_t):,} train / {len(tei_t):,} test)"
     )
 
+    n_tot = len(failed)
+    n_fail = int(np.sum(failed == 1))
+    n_hw = int(np.sum(hw == 1))
+    n_payload = n_fail - n_hw
+    ftype = targets["fault_type"] if "fault_type" in targets else None
+
+    if ftype is not None:
+        n_succ = int(np.sum(ftype == -1))
+        n_cancel = int(np.sum(ftype == -2))
+        n_app = int(np.sum(ftype == 0))
+        n_sub = int(np.sum(ftype == 2))
+        n_completed = n_tot - n_cancel
+
+        print(
+            f"  ├─ Clean Successes       : {n_succ:,} ({n_succ/n_tot*100:.2f}%)\n",
+            f"  ├─ Voluntary User Cancels: {n_cancel:,} ({n_cancel/n_tot*100:.2f}%)\n",
+            f"  └─ Genuine Failures      : {n_fail:,} ({n_fail/n_tot*100:.2f}% of total)\n",
+            f"-"*50,
+            f"\nFailure rate (excl. user removal): {n_fail/(n_tot-n_cancel)*100:.2f}%\n",
+            f"-"*50,
+        )
+
     if args.experiment == "e1":
         print(f"Running Experiment E1 (Job Failure Classification) [{args.model}]")
         CM = {}
@@ -593,6 +616,18 @@ if __name__ == "__main__":
         )
 
     elif args.experiment == "e3":
+        if ftype is not None:
+            print("FAULT ATTRIBUTION (Genuine Failures Only):")
+            print(f"  ├─ Payload Faults (App + Sub) : {n_payload:,} ({n_payload/n_fail*100:.1f}%)")
+            print(f"  │    ├─ Application Faults    : {n_app:,} ({n_app/n_fail*100:.1f}%)")
+            print(f"  │    └─ Submission Faults     : {n_sub:,} ({n_sub/n_fail*100:.1f}%)")
+            print(f"  └─ Hardware Faults            : {n_hw:,} ({n_hw/n_fail*100:.1f}%)")
+        else:
+            print(f"Total Submitted Jobs  : {n_tot:,}")
+            print(f"Genuine Failures      : {n_fail:,} ({n_fail/n_tot*100:.2f}%)")
+            print(f"  ├─ Payload Faults   : {n_payload:,} ({n_payload/n_fail*100:.1f}%)")
+            print(f"  └─ Hardware Faults  : {n_hw:,} ({n_hw/n_fail*100:.1f}%)")
+
         print(f"Running Experiment E3 (Fault Attribution: Hardware vs. Payload) [{args.model}]")
         CM = {}
         run_e3_model(

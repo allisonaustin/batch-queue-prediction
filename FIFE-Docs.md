@@ -4,9 +4,9 @@
 
 ### Dataset summary
 
-| Duration        | Jobs       | Batches    | Users | Sites | Failed    | % Failed |
-| --------------- | ---------- | ---------- | ----- | ----- | --------- | -------- |
-| 01/2024-06/2024 | 42,720,512 | 18,198,133 | 412   | 46    | 7,638,662 | 17.88    |
+| Duration              | Jobs           | Batches        | Users | Groups | Campaigns | Sites | Failed         | % Failed |
+| --------------------- | -------------- | -------------- | ----- | ------ | --------- | ----- | -------------- | -------- |
+| 02/01/2024-08/31/2024 | `64,025,075` | `20,065,140` | 395   | 27     | 684       | 44    |  `8,989,483` | 14.04    |
 
 *Dataset is not yet publically available, anonymization is underway
 
@@ -57,8 +57,8 @@ Rules apply top-down; the first match wins:
 
 ### Campaign Type
 
-| **Step** | **Stage Name**                                                                                               | **What it does**                   | **Job Profile**                       |
-| -------------- | ------------------------------------------------------------------------------------------------------------------ | ---------------------------------------- | ------------------------------------------- |
+| **Step** | **Stage Name**                                                                                                     | **What it does**                   | **Job Profile**                       |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------- | ------------------------------------------- |
 | Generation     | `gen, dio, endpoint, corsika, sim, wiremod, ly, offset, spill, g4, beamgun, decay, surface, cryo`                      | Simulates particles hitting the detector | **Heavy** : High CPU, long runtimes   |
 | Reconstruction | `stage0, stage1, reco, reco1, reco2, digi, track, decode, recluster, fullproduction, ndlar, compress, convert, fmatch` | Turns raw signals into 3D tracks/hits    | **Medium** : High memory usage        |
 | Merging        | `merge, skim, hadd, filter, scrub, watchdog, sleep, test, fclless, concat, mix`                                        | Combines 100 small files into 1 big file | **Light** : Low CPU, fast, mostly I/O |
