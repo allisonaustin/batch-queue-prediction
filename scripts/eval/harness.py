@@ -24,7 +24,7 @@ def mem_gb():
 
 def save_experiment_results(exp_name, lib, got_metrics, output_dir=None):
     """Loads existing experiment JSON, updates the entries for the model, and saves back to disk."""
-    output_dir = output_dir if output_dir is not None else os.getcwd() + "/output"
+    output_dir = output_dir if output_dir is not None else os.getcwd() + "/results"
     os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, f"{exp_name}_results.json")
 
@@ -209,7 +209,7 @@ def fit_eval_reg(
         if split is not None:
             model_dir = "/mnt/scratch/fast0/amaustin/tree-models/"
             os.makedirs(model_dir, exist_ok=True)
-            save_path = os.path.join(model_dir, f"{lib}_{exp_tag}_{split}.json")
+            save_path = os.path.join(model_dir, f"{lib}_reg_{exp_tag}_{split}.json")
             m.save_model(save_path)
             print(f"[{lib}] Saved regression model to {save_path}", flush=True)
 
@@ -225,7 +225,7 @@ def fit_eval_reg(
 
         if split is not None:
             os.makedirs(model_dir, exist_ok=True)
-            save_path = os.path.join(model_dir, f"{lib}_{exp_tag}_{split}.txt")
+            save_path = os.path.join(model_dir, f"{lib}_reg_{exp_tag}_{split}.txt")
             if lib in ("lightgbm", "lgb"):
                 m.booster_.save_model(save_path)
             elif lib in ("catboost", "cb"):

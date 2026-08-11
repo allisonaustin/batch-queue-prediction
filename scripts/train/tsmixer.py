@@ -107,6 +107,7 @@ def tsmixer_fit_eval(
     split=None,
     model_dir="/mnt/scratch/fast0/amaustin/dl-tabular-models",
     is_regression=False,
+    exp_tag=None,
 ):
     # Auto-detect regression task
     if kind in ["reg", "regression"]:
@@ -173,7 +174,7 @@ def tsmixer_fit_eval(
     best_score = -float("inf")
     patience, patience_counter, best_weights = 5, 0, None
 
-    for epoch in range(12):
+    for epoch in range(10):
         model.train()
         running_loss = 0.0
         for bx, by in loader_tr:
@@ -207,7 +208,7 @@ def tsmixer_fit_eval(
                 metric_label = "Val AUC"
 
         print(
-            f"    [TSMixer] Epoch {epoch+1:02d}/12 | Loss: {avg_loss:.4f} | {metric_label}: {val_score:.5f} (Best: {max(best_score, val_score):.5f})",
+            f"    [TSMixer] Epoch {epoch+1:02d}/10 | Loss: {avg_loss:.4f} | {metric_label}: {val_score:.5f} (Best: {max(best_score, val_score):.5f})",
             flush=True,
         )
 
@@ -225,7 +226,7 @@ def tsmixer_fit_eval(
 
     # Save trained model to disk
     os.makedirs(model_dir, exist_ok=True)
-    save_path = os.path.join(model_dir, f"tsmixer_{kind}_{split}.pt")
+    save_path = os.path.join(model_dir, f"tsmixer_{kind}_{exp_tag}_ {split}.pt")
     torch.save(model.state_dict(), save_path)
     print(f"    [TSMixer] Saved checkpoint to {save_path}", flush=True)
 

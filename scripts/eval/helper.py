@@ -29,6 +29,7 @@ MODEL_DISPLAY_NAMES = {
     "ft_transformer": "FT-Transformer",
     "tsmixer": "TSMixer",
     "tabr": "TabR",
+    "hierarchical": "Hierarchical",
 }
 
 PREFERRED_MODEL_ORDER = [
@@ -42,6 +43,7 @@ PREFERRED_MODEL_ORDER = [
     "ft_transformer",
     "tsmixer",
     "tabr",
+    "hierarchical"
 ]
 
 # ---- Memory Helpers ----
@@ -105,8 +107,23 @@ def reg_metrics(y_true_log, pred_log):
     b_med = (wt_true >= 600) & (wt_true < 7200)
     b_long = wt_true >= 7200
 
+    # sMAPE on the raw second scale, symmetric so a 10x over- and
+    # under-prediction cost the same. Jobs where both true and predicted wait
+    # round to ~0 have no meaningful relative error, so they score 0 rather
+    # than dividing by a vanishing denominator.
+    denom = (np.abs(wt_true) + np.abs(wt_pred)) / 2.0
+    nonzero = denom > 1e-8
+    smape_vals = np.zeros_like(wt_true, dtype=np.float64)
+    if np.any(nonzero):
+        smape_vals[nonzero] = np.abs(wt_true[nonzero] - wt_pred[nonzero]) / denom[nonzero]
+
     return {
         "r2_log": float(r2_score(y_true_log, pred_log)),
+        # Scale-free error in log1p space -- the space the models train in, so
+        # this is the loss they actually optimize rather than a raw-second
+        # figure dominated by the longest queues.
+        "mae_log1p": float(np.mean(np.abs(y_true_log - pred_log))),
+        "smape_pct": float(100.0 * np.mean(smape_vals)),
         "median_ae_s": float(np.median(ae)),
         "within2x": float(
             np.mean((wt_pred <= 2 * wt_true + 1) & (wt_true <= 2 * wt_pred + 1))
@@ -115,6 +132,12 @@ def reg_metrics(y_true_log, pred_log):
         "mae_10m": float(ae[b_short].mean()) if b_short.any() else np.nan,
         "mae_2h": float(ae[b_med].mean()) if b_med.any() else np.nan,
         "mae_long": float(ae[b_long].mean()) if b_long.any() else np.nan,
+        # Median AE per bin, alongside the mean: wait times are heavily
+        # right-skewed within every bin too, so mean AE can look far worse
+        # than the error a typical job in that bin actually sees.
+        "median_ae_10m": float(np.median(ae[b_short])) if b_short.any() else np.nan,
+        "median_ae_2h": float(np.median(ae[b_med])) if b_med.any() else np.nan,
+        "median_ae_long": float(np.median(ae[b_long])) if b_long.any() else np.nan,
     }
 
 
@@ -281,7 +304,7 @@ def evaluate_protocol_models(
     ),
     preferred_models=PREFERRED_MODEL_ORDER,
     batch_size=32768,
-    output_path="output/protocol_eval_results.json",
+    output_path="results/protocol_eval_results.json",
 ):
     """Recomputes exact training thresholds on `trs` training sub-samples, evaluates test sets, and exports JSON results."""
     aliases = {
@@ -910,67 +933,111 @@ def predict_reg_model(path, X_data, batch_size=32768, device=None):
     raise ValueError(f"Unrecognized model file format: {fname}")
 
 
-def evaluate_wait_models(model_paths, X_test, y_test_raw, is_log_pred=True):
-    """Evaluates saved regression models, cleanly filtering NaNs and Infs for Log1p MAE, sMAPE, and Raw MAE."""
+def campaign_breakdown(y_true, y_pred, campaign_ids, min_n=100, group_cols=None):
+    """Per-campaign wait-time error, for spotting which campaigns are easier
+    or harder to predict than the model's overall average. Campaigns with
+    fewer than `min_n` test jobs are dropped -- their error estimates are too
+    noisy to compare against campaigns with thousands of jobs.
+
+    `group_cols`: optional {name: row-aligned array} of extra categorical
+    columns to summarize per campaign (majority value among that campaign's
+    jobs) -- e.g. for coloring a campaign-level plot by some coarser
+    category. Since a campaign's own metadata columns are normally constant
+    across its jobs, majority-vote just recovers that constant value.
+    """
+    campaign_ids = np.asarray(campaign_ids)
+    ae = np.abs(np.asarray(y_pred, dtype=np.float64) - np.asarray(y_true, dtype=np.float64))
+    valid = ~np.isnan(campaign_ids) & (campaign_ids >= 0)
+    group_cols = group_cols or {}
+
+    out = {}
+    for cid in np.unique(campaign_ids[valid]):
+        m = valid & (campaign_ids == cid)
+        n = int(m.sum())
+        if n < min_n:
+            continue
+        entry = {
+            "n_jobs": n,
+            "median_ae_s": float(np.median(ae[m])),
+            "mean_ae_s": float(np.mean(ae[m])),
+        }
+        for name, arr in group_cols.items():
+            vals, counts = np.unique(np.asarray(arr)[m], return_counts=True)
+            entry[name] = float(vals[np.argmax(counts)])
+        out[int(cid)] = entry
+    return out
+
+
+def evaluate_wait_models(
+    model_paths, X_test, y_test_raw, is_log_pred=True,
+    campaign_ids=None, min_campaign_n=100, campaign_group_cols=None,
+):
+    """Evaluates saved regression models already on disk (no retraining --
+    loads each cached model and scores it on X_test/y_test_raw). Reuses
+    `reg_metrics` so results match the same schema `eval/harness.py` writes
+    to `results/wait_time_results.json`, plus a per-campaign error breakdown
+    when `campaign_ids` (row-aligned with X_test) is given. `campaign_group_cols`
+    (optional {name: row-aligned array}) is forwarded to `campaign_breakdown`
+    to also tag each campaign with the majority value of another column
+    (e.g. for coloring a campaign-level plot by some coarser category).
+
+    Returns (df_eval, results_by_model, campaign_by_model):
+      - df_eval: flat summary table, one row per model, sorted by r2_log.
+      - results_by_model: {raw_key: reg_metrics(...) dict} -- same shape as
+        wait_time_results.json's per-model/per-split entries.
+      - campaign_by_model: {raw_key: {campaign_id: {...}}} or {} if
+        campaign_ids wasn't provided.
+    """
     y_true = np.asarray(y_test_raw, dtype=np.float64).ravel()
-    results = []
+    rows = []
+    results_by_model = {}
+    campaign_by_model = {}
 
     for path in model_paths:
         model_name = os.path.basename(path)
-        parent_dir = os.path.basename(os.path.dirname(path))
+        raw_key = model_name.split("_")[0].lower()
 
         try:
             preds = predict_reg_model(path, X_test)
-            
-            # Convert back to raw seconds scale if model predicted log1p(wait_time)
-            # Clip predictions between -20 and 20 to prevent np.expm1 overflow to float inf
-            if is_log_pred:
-                preds_clipped = np.clip(np.asarray(preds, dtype=np.float64), -20.0, 20.0)
-                y_pred = np.expm1(preds_clipped)
-            else:
-                y_pred = preds
-            
-            y_pred = np.maximum(0, np.asarray(y_pred, dtype=np.float64).ravel())
-            y_true_clean = np.maximum(0, y_true)
+            preds = np.asarray(preds, dtype=np.float64).ravel()
 
-            # Filter valid finite rows across both target and prediction vectors
-            valid_mask = np.isfinite(y_true_clean) & np.isfinite(y_pred)
+            # reg_metrics expects both true and predicted values already in
+            # log1p space; clip to prevent np.expm1 overflow downstream.
+            pred_log = np.clip(preds, -20.0, 20.0) if is_log_pred else np.log1p(np.maximum(0, preds))
+            y_true_clean = np.maximum(0, y_true)
+            y_true_log = np.log1p(y_true_clean)
+
+            valid_mask = np.isfinite(y_true_log) & np.isfinite(pred_log)
             if not np.any(valid_mask):
                 print(f"[SKIP] {model_name}: No valid finite predictions found.")
                 continue
 
-            yt = y_true_clean[valid_mask]
-            yp = y_pred[valid_mask]
+            mm = reg_metrics(y_true_log[valid_mask], pred_log[valid_mask])
+            results_by_model[raw_key] = mm
+            rows.append({"Model": raw_key, "Model File": model_name, **mm})
 
-            # 1. Log1p MAE
-            l1p_mae = float(np.mean(np.abs(np.log1p(yt) - np.log1p(yp))))
+            if campaign_ids is not None:
+                y_pred = np.maximum(0, np.expm1(pred_log[valid_mask]))
+                group_cols = {
+                    name: np.asarray(arr)[valid_mask]
+                    for name, arr in (campaign_group_cols or {}).items()
+                }
+                campaign_by_model[raw_key] = campaign_breakdown(
+                    y_true_clean[valid_mask],
+                    y_pred,
+                    np.asarray(campaign_ids)[valid_mask],
+                    min_n=min_campaign_n,
+                    group_cols=group_cols,
+                )
 
-            # 2. sMAPE (%)
-            denom = (np.abs(yt) + np.abs(yp)) / 2.0
-            nonzero = denom > 1e-8
-            smape_vals = np.zeros_like(yt)
-            if np.any(nonzero):
-                smape_vals[nonzero] = np.abs(yt[nonzero] - yp[nonzero]) / denom[nonzero]
-            smape_pct = float(100.0 * np.mean(smape_vals))
-
-            # 3. Raw MAE
-            r_mae = float(np.mean(np.abs(yt - yp)))
-
-            results.append({
-                "Directory": parent_dir,
-                "Model File": model_name,
-                "Log1p MAE": l1p_mae,
-                "sMAPE (%)": smape_pct,
-                "Raw MAE (s)": r_mae,
-            })
             print(f"[OK] {model_name}")
         except Exception as e:
             print(f"[FAILED] {model_name}: {e}")
 
-    df_eval = pd.DataFrame(results)
+    df_eval = pd.DataFrame(rows)
     if not df_eval.empty:
-        df_eval = df_eval.sort_values("Log1p MAE", ascending=True).reset_index(drop=True)
-    return df_eval
+        df_eval = df_eval.sort_values("r2_log", ascending=False).reset_index(drop=True)
+    return df_eval, results_by_model, campaign_by_model
 
 # ---- Visualizations ----
 def _klabel(k):

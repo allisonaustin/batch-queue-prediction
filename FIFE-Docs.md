@@ -55,6 +55,27 @@ Rules apply top-down; the first match wins:
 4. Removed with null code & signal → `RemoveReason` rules below; unmatched reasons → **Hardware**.
 5. `LastHoldReasonCode` rules are kept for completeness: a job that ends held-then-removed typically also carries a `RemoveReason` or exit code that matches an earlier rule.
 
+### Campaign Type
+
+| **Step** | **Stage Name**                                                                                               | **What it does**                   | **Job Profile**                       |
+| -------------- | ------------------------------------------------------------------------------------------------------------------ | ---------------------------------------- | ------------------------------------------- |
+| Generation     | `gen, dio, endpoint, corsika, sim, wiremod, ly, offset, spill, g4, beamgun, decay, surface, cryo`                      | Simulates particles hitting the detector | **Heavy** : High CPU, long runtimes   |
+| Reconstruction | `stage0, stage1, reco, reco1, reco2, digi, track, decode, recluster, fullproduction, ndlar, compress, convert, fmatch` | Turns raw signals into 3D tracks/hits    | **Medium** : High memory usage        |
+| Merging        | `merge, skim, hadd, filter, scrub, watchdog, sleep, test, fclless, concat, mix`                                        | Combines 100 small files into 1 big file | **Light** : Low CPU, fast, mostly I/O |
+| Analysis       | `ana, caf, ntuple, larcv`                                                                                              | Runs the actual physics math             | Variable: Depends on user code              |
+
+Matching is case-insensitive substring, against `POMS4_CAMPAIGN_STAGE_NAME`. Jobs with no
+`POMS4_*` fields are not part of a campaign and are typed **User**, giving 5 values overall.
+`POMS4_CAMPAIGN_TYPE` itself is null for 100% of rows in the raw data and is unusable.
+
+Composite stage names (e.g. `gen_g4_detsim_reco1_reco2_caf`) match several categories at once;
+the **rightmost** match wins, on the assumption the terminal step is what the stage delivers
+(that example → Analysis). This tie-break decides ~2.98M jobs across 45 composite names.
+
+Note `decay` rather than `run4_decay`: the latter misses `Run5_DecayNoKill` (135,031 jobs).
+This table is mirrored by `CAMPAIGN_TYPE_KEYWORDS` in `scripts/attribution-modeling.ipynb`;
+keep the two in sync.
+
 #### LastHoldReasonCodes
 
 [HTCondor Docs](https://htcondor.readthedocs.io/en/24.x/codes-other-values/hold-reason-codes.html)
@@ -198,4 +219,3 @@ Observed volumes and job failure rates by `LastHoldReasonCode` (01-06/2024; neve
 | 121        |            | Application  |
 | 122        |            | Application  |
 | 124        |            | Application  |
-

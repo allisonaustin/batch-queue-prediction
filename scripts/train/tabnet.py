@@ -83,7 +83,7 @@ def tabnet_fit_eval(
         num_workers=0,
         pin_memory=pin_mem,
         drop_last=False,
-        compute_importance=want_imp,
+        compute_importance=False,
     )
 
     save_path = os.path.join(model_dir, f"tabnet_{kind}_{exp_tag}_{split}")
