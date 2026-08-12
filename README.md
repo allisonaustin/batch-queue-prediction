@@ -29,11 +29,13 @@ fife-batch-jobs/
 │   │   └── helper.py               # Model loaders, metrics, and prediction routines
 │   ├── train/                      # Model implementations
 │   ├── output/                     # Evaluation metrics and feature importance output JSONs
-│   ├── data-explorer.ipynb  		# Job data visualizations
-│   ├── attribution-modeling.ipynb  # Job data analysis and prediction result visualizations
+│   ├── data-explorer.ipynb  		# Job data visualization app example (work in progress)
+│   ├── data-analysis.ipynb  		# Initial job data analysis
+	├── feat-engineering.ipynb  	# Training and testing setup for job prediction tasks
+	└── pred-analysis.ipynb         # Job prediction result visualizations
 ├── .gitignore                      # Dataset and runtime configuration
-├── CLAUDE.md                       # Global instructions for Claude                
-├── FIFE-Docs.md                    # FIFE Batch Queue data documentation                
+├── CLAUDE.md                       # Global instructions for Claude              
+├── FIFE-Docs.md                    # FIFE Batch Queue data documentation              
 ├── MODELING.md                     # Detailed modeling design notes
 ├── README.md                       # Repo info
 └── config.json						# Dataset and runtime configuration
