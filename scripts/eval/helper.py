@@ -287,27 +287,103 @@ def log_result(exp_name, model, split, **kwargs):
     pass  # Placeholder for custom logging callbacks
 
 
-# ---- Model Instantiation & Importance Extraction Helpers ----
 class MLPAdapter(nn.Module):
-    """Wraps train.mlp.MLP so generic evaluators calling model(X) work seamlessly."""
+    """Wraps train.mlp.MLP safely with categorical bounds checking."""
 
-    def __init__(self, model, n_cat):
+    def __init__(self, model, n_cat, cards_f):
         super().__init__()
         self.model = model
         self.n_cat = n_cat
+        self.cards_f = cards_f
 
     def forward(self, x):
         if self.n_cat > 0:
+            # Clamp categorical columns to valid embedding bounds [0, max_cardinality - 1]
             xc = x[:, : self.n_cat].long()
+            for col_i, card in enumerate(self.cards_f):
+                xc[:, col_i] = torch.clamp(xc[:, col_i], min=0, max=card - 1)
             xn = x[:, self.n_cat :].float()
         else:
             xc = torch.zeros((x.shape[0], 0), dtype=torch.long, device=x.device)
             xn = x.float()
         return self.model(xc, xn)
 
+def _predict_pytorch_model(net, X_mat, batch_size, device):
+    """Executes robust inference by dynamically probing the model's required forward pass signature."""
+    net = net.to(device)
+    net.eval()
+
+    probe = torch.tensor(X_mat[:2], dtype=torch.float32, device=device)
+
+    # Determine categorical feature count
+    n_cat = 0
+    if hasattr(net, "cards_f") and net.cards_f is not None:
+        n_cat = len(net.cards_f)
+    elif hasattr(net, "embs") and isinstance(net.embs, torch.nn.ModuleList):
+        n_cat = len(net.embs)
+
+    forward_fn = None
+
+    # Probe 1: Split x_cat and x_num
+    if n_cat > 0:
+        try:
+            x_c = probe[:, :n_cat].long()
+            x_n = probe[:, n_cat:]
+            out = net(x_c, x_n)
+            if isinstance(out, (torch.Tensor, tuple)):
+                forward_fn = lambda b: net(b[:, :n_cat].long(), b[:, n_cat:])
+        except Exception:
+            pass
+
+    # Probe 2: Single matrix input
+    if forward_fn is None:
+        try:
+            out = net(probe)
+            if isinstance(out, (torch.Tensor, tuple)):
+                forward_fn = lambda b: net(b)
+        except Exception:
+            pass
+
+    # Probe 3: Explicit empty x_cat with x_num
+    if forward_fn is None:
+        try:
+            x_c = torch.empty((2, 0), dtype=torch.long, device=device)
+            out = net(x_c, probe)
+            forward_fn = lambda b: net(
+                torch.empty((len(b), 0), dtype=torch.long, device=device), b
+            )
+        except Exception:
+            pass
+
+    if forward_fn is None:
+        forward_fn = lambda b: net(b)
+
+    probs = []
+    with torch.no_grad():
+        for start in range(0, len(X_mat), batch_size):
+            bx = torch.tensor(
+                X_mat[start : start + batch_size],
+                dtype=torch.float32,
+                device=device,
+            )
+            out = forward_fn(bx)
+
+            if isinstance(out, tuple):
+                out = out[0]
+            if hasattr(out, "logits"):
+                out = out.logits
+
+            if out.ndim > 1 and out.shape[1] > 1:
+                p = torch.softmax(out, dim=1)[:, 1]
+            else:
+                p = torch.sigmoid(out.squeeze())
+
+            probs.append(p.cpu().numpy())
+
+    return np.concatenate(probs)
 
 def predict_proba_model(m_lower, path, X_data, batch_size=32768, device=None):
-    """Generates predicted probabilities P(y=1) across tree models, TabNet, and PyTorch architectures."""
+    """Predicts class probabilities across tree-based, TabNet, and PyTorch models."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -364,62 +440,50 @@ def predict_proba_model(m_lower, path, X_data, batch_size=32768, device=None):
         clf.load_model(path)
         return np.asarray(clf.predict_proba(X_mat)[:, 1], dtype=np.float32)
 
-    # 3. PyTorch Deep Learning Models (MLP, SAINT, FT, TSMixer, TabR)
+    # 3. PyTorch Models
     elif path.endswith((".pt", ".pth")):
         loaded_obj = torch.load(path, map_location=device)
-        state_dict = (
-            loaded_obj["state_dict"]
-            if isinstance(loaded_obj, dict) and "state_dict" in loaded_obj
-            else loaded_obj
-        )
-        if isinstance(state_dict, dict):
-            state_dict = {
-                k.replace("module.", "").replace("model.", ""): v
-                for k, v in state_dict.items()
-            }
 
-        net = _instantiate_pytorch_model(
-            m_lower, X_mat.shape[1], state_dict=state_dict
-        )
+        if isinstance(loaded_obj, torch.nn.Module):
+            net = loaded_obj
+        elif isinstance(loaded_obj, dict) and isinstance(
+            loaded_obj.get("model"), torch.nn.Module
+        ):
+            net = loaded_obj["model"]
+        else:
+            state_dict = (
+                loaded_obj.get("state_dict")
+                or loaded_obj.get("model_state_dict")
+                or loaded_obj
+                if isinstance(loaded_obj, dict)
+                else loaded_obj
+            )
+
+            # Strip key prefixes if present
+            if isinstance(state_dict, dict):
+                cleaned_sd = {}
+                for k, v in state_dict.items():
+                    new_k = k
+                    for prefix in [
+                        "module.",
+                        "model.",
+                        "_orig_mod.",
+                        "net.",
+                        "mlp.",
+                    ]:
+                        if new_k.startswith(prefix):
+                            new_k = new_k[len(prefix) :]
+                    cleaned_sd[new_k] = v
+                state_dict = cleaned_sd
+
+            net = _instantiate_pytorch_model(
+                m_lower, X_mat.shape[1], state_dict=state_dict
+            )
+
         if net is None:
-            raise ValueError(f"Could not instantiate model for {m_lower}")
+            raise ValueError(f"Could not instantiate PyTorch model for {m_lower}")
 
-        net = net.to(device)
-        if isinstance(state_dict, dict) and m_lower != "mlp":
-            try:
-                net.load_state_dict(state_dict, strict=True)
-            except Exception:
-                net.load_state_dict(state_dict, strict=False)
-        net.eval()
-
-        probs = []
-        with torch.no_grad():
-            for start in range(0, len(X_mat), batch_size):
-                bx = torch.tensor(
-                    X_mat[start : start + batch_size],
-                    dtype=torch.float32,
-                    device=device,
-                )
-                try:
-                    out = net(bx)
-                except TypeError:
-                    x_cat = torch.empty(
-                        (len(bx), 0), dtype=torch.long, device=device
-                    )
-                    out = net(x_cat, bx)
-
-                if isinstance(out, tuple):
-                    out = out[0]
-                if hasattr(out, "logits"):
-                    out = out.logits
-
-                if out.ndim > 1 and out.shape[1] > 1:
-                    p = torch.softmax(out, dim=1)[:, 1]
-                else:
-                    p = torch.sigmoid(out.squeeze())
-
-                probs.append(p.cpu().numpy())
-        return np.concatenate(probs)
+        return _predict_pytorch_model(net, X_mat, batch_size, device)
 
     raise ValueError(f"Unrecognized model path format: {path}")
 
@@ -438,9 +502,10 @@ def evaluate_protocol_models(
     ),
     preferred_models=PREFERRED_MODEL_ORDER,
     batch_size=32768,
+    exp_tag="bin_e1",
     output_path="results/protocol_eval_results.json",
 ):
-    """Recomputes exact training thresholds on `trs` training sub-samples, evaluates test sets, and exports JSON results."""
+    """Evaluates models across Random and Temporal splits using thr_r statically calibrated on the Random split validation set."""
     aliases = {
         "xgboost": ["xgboost", "xgb"],
         "lightgbm": ["lightgbm", "lgb"],
@@ -453,25 +518,8 @@ def evaluate_protocol_models(
         "tabr": ["tabr"],
     }
 
-    results = {
-        "models": [],
-        "roc_auc_r": [],
-        "pr_auc_r": [],
-        "prec_r": [],
-        "rec_r": [],
-        "f1_r": [],
-        "thr_r": [],
-        "roc_auc_t": [],
-        "pr_auc_t": [],
-        "prec_t": [],
-        "rec_t": [],
-        "f1_t": [],
-        "thr_t": [],
-    }
-
-    # Prepare threshold estimation sub-samples (trs) matching training code
+    results = {}
     trs_r = thr_sample(rtr)
-    trs_t = thr_sample(tri_t)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -486,9 +534,14 @@ def evaluate_protocol_models(
                         continue
                     for fname in sorted(os.listdir(d)):
                         fn_lower = fname.lower()
+                        has_alias = any(s in fn_lower for s in search_names)
+                        has_split = split in fn_lower
+                        has_tag = exp_tag is None or exp_tag.lower() in fn_lower
+
                         if (
-                            any(s in fn_lower for s in search_names)
-                            and split in fn_lower
+                            has_alias
+                            and has_split
+                            and has_tag
                             and fn_lower.endswith(
                                 (
                                     ".zip",
@@ -508,57 +561,44 @@ def evaluate_protocol_models(
 
             if "random" in matched_paths and "temporal" in matched_paths:
                 try:
-                    print(f"\n[Evaluating] {m.upper()}")
+                    print(
+                        f"\n[Evaluating Fixed Threshold] {m.upper()} (Tag: {exp_tag})"
+                    )
 
-                    # --- 1. Random Split Evaluation ---
-                    # Predict on training sample trs to compute exact threshold
+                    # 1. Calibrate threshold statically on Random split validation subsample
                     p_trs_r = predict_proba_model(
-                        m_lower, matched_paths["random"], X_all[trs_r], batch_size=batch_size
+                        m_lower,
+                        matched_paths["random"],
+                        X_all[trs_r],
+                        batch_size=batch_size,
                     )
                     thr_r = pick_thr(y_all[trs_r], p_trs_r)
 
-                    # Predict on test set rte
+                    # 2. Evaluate Random test set
                     p_te_r = predict_proba_model(
-                        m_lower, matched_paths["random"], X_all[rte], batch_size=batch_size
+                        m_lower,
+                        matched_paths["random"],
+                        X_all[rte],
+                        batch_size=batch_size,
                     )
                     m_rnd = cls_metrics(y_all[rte], p_te_r, thr=thr_r)
 
-                    # --- 2. Temporal Split Evaluation ---
-                    # Predict on training sample trs to compute exact threshold
-                    p_trs_t = predict_proba_model(
-                        m_lower, matched_paths["temporal"], X_all[trs_t], batch_size=batch_size
-                    )
-                    thr_t = pick_thr(y_all[trs_t], p_trs_t)
-
-                    # Predict on test set tei_t
+                    # 3. Evaluate Temporal test set using thr_r
                     p_te_t = predict_proba_model(
-                        m_lower, matched_paths["temporal"], X_all[tei_t], batch_size=batch_size
+                        m_lower,
+                        matched_paths["temporal"],
+                        X_all[tei_t],
+                        batch_size=batch_size,
                     )
-                    m_tmp = cls_metrics(y_all[tei_t], p_te_t, thr=thr_t)
+                    m_tmp = cls_metrics(y_all[tei_t], p_te_t, thr=thr_r)
 
-                    display_name = MODEL_DISPLAY_NAMES.get(m_lower, m)
-                    results["models"].append(display_name)
-
-                    # Store Metrics
-                    results["roc_auc_r"].append(m_rnd["roc_auc"])
-                    results["pr_auc_r"].append(m_rnd["pr_auc"])
-                    results["prec_r"].append(m_rnd["precision"])
-                    results["rec_r"].append(m_rnd["recall"])
-                    results["f1_r"].append(m_rnd["f1"])
-                    results["thr_r"].append(m_rnd["threshold"])
-
-                    results["roc_auc_t"].append(m_tmp["roc_auc"])
-                    results["pr_auc_t"].append(m_tmp["pr_auc"])
-                    results["prec_t"].append(m_tmp["precision"])
-                    results["rec_t"].append(m_tmp["recall"])
-                    results["f1_t"].append(m_tmp["f1"])
-                    results["thr_t"].append(m_tmp["threshold"])
+                    results[m_lower] = {"random": m_rnd, "temporal": m_tmp}
 
                     print(
                         f"  Random   | ROC: {m_rnd['roc_auc']:.3f} | PR: {m_rnd['pr_auc']:.3f} | P: {m_rnd['precision']:.3f} | R: {m_rnd['recall']:.3f} | F1: {m_rnd['f1']:.3f} @ thr={thr_r:.4f}"
                     )
                     print(
-                        f"  Temporal | ROC: {m_tmp['roc_auc']:.3f} | PR: {m_tmp['pr_auc']:.3f} | P: {m_tmp['precision']:.3f} | R: {m_tmp['recall']:.3f} | F1: {m_tmp['f1']:.3f} @ thr={thr_t:.4f}"
+                        f"  Temporal | ROC: {m_tmp['roc_auc']:.3f} | PR: {m_tmp['pr_auc']:.3f} | P: {m_tmp['precision']:.3f} | R: {m_tmp['recall']:.3f} | F1: {m_tmp['f1']:.3f} @ thr={thr_r:.4f} (fixed)"
                     )
 
                 except Exception as e:
@@ -574,6 +614,134 @@ def evaluate_protocol_models(
 
     return results
 
+
+def _instantiate_pytorch_model(m_name, n_feats, state_dict=None):
+    """Dynamically reconstructs PyTorch architectures by inspecting state_dict weight shapes without assuming fixed key names."""
+    m_name = m_name.lower()
+
+    if m_name == "mlp":
+        from train.mlp import MLP
+
+        if isinstance(state_dict, dict) and len(state_dict) > 0:
+            # 1. Identify embedding weights (keys with 'emb' in name)
+            emb_keys = sorted(
+                [
+                    k
+                    for k, v in state_dict.items()
+                    if isinstance(v, torch.Tensor)
+                    and v.ndim == 2
+                    and "emb" in k.lower()
+                ],
+                key=lambda k: k,
+            )
+            cards_f = [state_dict[k].shape[0] for k in emb_keys]
+            sum_emb_dim = sum(state_dict[k].shape[1] for k in emb_keys)
+
+            # 2. Identify all 2D linear weight matrices excluding embeddings
+            linear_keys = [
+                k
+                for k, v in state_dict.items()
+                if isinstance(v, torch.Tensor)
+                and v.ndim == 2
+                and k not in emb_keys
+            ]
+
+            if linear_keys:
+                # The last linear layer is the output head; preceding ones are hidden layers
+                head_key = linear_keys[-1]
+                body_keys = linear_keys[:-1]
+
+                if body_keys:
+                    first_linear_in = state_dict[body_keys[0]].shape[1]
+                    hidden = [state_dict[k].shape[0] for k in body_keys]
+                else:
+                    first_linear_in = state_dict[head_key].shape[1]
+                    hidden = []
+
+                n_num = first_linear_in - sum_emb_dim
+                out_dim = state_dict[head_key].shape[0]
+
+                net = MLP(
+                    cards_f=cards_f,
+                    n_num=n_num,
+                    out=out_dim,
+                    hidden=tuple(hidden),
+                )
+                net.load_state_dict(state_dict, strict=False)
+                return net
+
+        net = MLP(cards_f=[], n_num=n_feats)
+        if isinstance(state_dict, dict):
+            net.load_state_dict(state_dict, strict=False)
+        return net
+
+    elif m_name in ("ft", "ft_transformer"):
+        from train.ft import FTTransformer
+
+        d_token = 32
+        depth = 2
+        heads = 4
+        if isinstance(state_dict, dict):
+            if "feature_embedder.weight" in state_dict:
+                d_token = state_dict["feature_embedder.weight"].shape[-1]
+            transformer_keys = [
+                k for k in state_dict if "transformer.layers." in k
+            ]
+            if transformer_keys:
+                depth = (
+                    max(
+                        [
+                            int(k.split("transformer.layers.")[1].split(".")[0])
+                            for k in transformer_keys
+                            if k.split("transformer.layers.")[1]
+                            .split(".")[0]
+                            .isdigit()
+                        ]
+                    )
+                    + 1
+                )
+
+        net = FTTransformer(
+            num_features=n_feats, d_token=d_token, depth=depth, heads=heads
+        )
+        if isinstance(state_dict, dict):
+            net.load_state_dict(state_dict, strict=False)
+        return net
+
+    elif m_name == "saint":
+        from train.saint import SAINT
+
+        d_token = 32
+        depth = 2
+        heads = 4
+        cat_dims = []
+        n_num = n_feats
+
+        if isinstance(state_dict, dict):
+            if "num_embed" in state_dict:
+                n_num = state_dict["num_embed"].shape[0]
+                d_token = state_dict["num_embed"].shape[1]
+
+            layer_indices = [
+                int(k.split(".")[1])
+                for k in state_dict.keys()
+                if k.startswith("layers.") and k.split(".")[1].isdigit()
+            ]
+            if layer_indices:
+                depth = max(layer_indices) + 1
+
+        net = SAINT(
+            n_num=n_num,
+            cat_dims=cat_dims,
+            d_token=d_token,
+            depth=depth,
+            heads=heads,
+        )
+        if isinstance(state_dict, dict):
+            net.load_state_dict(state_dict, strict=False)
+        return net
+
+    return None
 
 def compute_permutation_importance(
     model, X_eval, y_eval, device="cuda", batch_size=32768, sample_size=None
@@ -663,9 +831,8 @@ def extract_tree_importance(model_name, file_path, n_feats):
     total = np.sum(imp)
     return (imp / total) if total > 0 else imp
 
-
 def _instantiate_pytorch_model(m_name, n_feats, state_dict=None):
-    """Dynamically instantiates PyTorch models using checkpoint dimensions."""
+    """Dynamically instantiates PyTorch models inspecting state_dict shapes."""
     m_name = m_name.lower()
 
     if m_name == "mlp":
@@ -680,54 +847,50 @@ def _instantiate_pytorch_model(m_name, n_feats, state_dict=None):
                 ],
                 key=lambda k: int(k.split(".")[1]),
             )
-            cards_f = [state_dict[k].shape[0] - 1 for k in emb_keys]
+            cards_f = [state_dict[k].shape[0] for k in emb_keys]
             sum_emb_dim = sum(state_dict[k].shape[1] for k in emb_keys)
 
-            first_linear_in = state_dict["body.0.weight"].shape[1]
+            # Filter exclusively for 2D weights (nn.Linear) and exclude 1D weights (nn.BatchNorm1d)
+            linear_keys = sorted(
+                [
+                    k for k, v in state_dict.items()
+                    if k.startswith("body.") and k.endswith(".weight") and v.ndim == 2
+                ],
+                key=lambda k: int(k.split(".")[1])
+            )
+
+            first_linear_in = state_dict[linear_keys[0]].shape[1]
             n_num = first_linear_in - sum_emb_dim
             out_dim = state_dict["head.weight"].shape[0]
 
-            hidden = []
-            idx = 0
-            while f"body.{idx}.weight" in state_dict:
-                hidden.append(state_dict[f"body.{idx}.weight"].shape[0])
-                idx += 4
+            # Reconstruct hidden layer dimensions from Linear output features
+            hidden = [state_dict[k].shape[0] for k in linear_keys]
 
             net = MLP(cards_f=cards_f, n_num=n_num, out=out_dim, hidden=tuple(hidden))
             net.load_state_dict(state_dict)
-            return MLPAdapter(net, len(cards_f))
+            return MLPAdapter(net, len(cards_f), cards_f)
         else:
             net = MLP(cards_f=[], n_num=n_feats)
-            return MLPAdapter(net, 0)
+            return MLPAdapter(net, 0, [])
 
     elif m_name in ("ft", "ft_transformer"):
         from train.ft import FTTransformer
 
-        return FTTransformer(num_features=n_feats, d_token=32, depth=2, heads=4)
+        d_token = 32
+        depth = 2
+        heads = 4
+        if isinstance(state_dict, dict):
+            if "feature_embedder.weight" in state_dict:
+                d_token = state_dict["feature_embedder.weight"].shape[-1]
+            transformer_keys = [k for k in state_dict if k.startswith("transformer.layers.")]
+            if transformer_keys:
+                depth = max([int(k.split(".")[2]) for k in transformer_keys]) + 1
 
-    elif m_name == "tsmixer":
-        import train.tsmixer as tsm_mod
+        return FTTransformer(num_features=n_feats, d_token=d_token, depth=depth, heads=heads)
 
-        for cls_name in ("TSMixer", "TSMixerModel"):
-            if hasattr(tsm_mod, cls_name):
-                cls = getattr(tsm_mod, cls_name)
-                for kw in [
-                    {"num_features": n_feats},
-                    {"in_features": n_feats},
-                    {"d_in": n_feats},
-                ]:
-                    try:
-                        return cls(**kw)
-                    except Exception:
-                        pass
-
-    if m_name == "saint":
+    elif m_name == "saint":
         try:
-            try:
-                from train.saint import SAINT
-            except ImportError:
-                sys.path.append(os.getcwd())
-                from train.saint import SAINT
+            from train.saint import SAINT
 
             d_token = 32
             depth = 2
@@ -735,33 +898,18 @@ def _instantiate_pytorch_model(m_name, n_feats, state_dict=None):
             cat_dims = []
             n_num = n_feats
 
-            # Inspect state_dict to reconstruct exact model dimensions
             if isinstance(state_dict, dict):
                 if "num_embed" in state_dict:
                     n_num = state_dict["num_embed"].shape[0]
                     d_token = state_dict["num_embed"].shape[1]
 
-                # Infer depth from layer indices
                 layer_indices = [
                     int(k.split(".")[1])
                     for k in state_dict.keys()
-                    if k.startswith("layers.")
+                    if k.startswith("layers.") and k.split(".")[1].isdigit()
                 ]
                 if layer_indices:
                     depth = max(layer_indices) + 1
-
-                # Reconstruct cat_dims if categorical features were used
-                if "cat_offsets" in state_dict and "cat_embed.weight" in state_dict:
-                    offsets = state_dict["cat_offsets"].cpu().tolist()
-                    total_embeds = state_dict["cat_embed.weight"].shape[0]
-                    cat_dims = []
-                    for i in range(len(offsets)):
-                        next_off = (
-                            offsets[i + 1]
-                            if i + 1 < len(offsets)
-                            else total_embeds
-                        )
-                        cat_dims.append(next_off - offsets[i])
 
             return SAINT(
                 n_num=n_num,
@@ -774,20 +922,7 @@ def _instantiate_pytorch_model(m_name, n_feats, state_dict=None):
             print(f"[Error Instantiating SAINT] {e}")
             return None
 
-    elif m_name == "tabr":
-        import train.tabr as tabr_mod
-
-        for cls_name in ("TabR", "TabRModel"):
-            if hasattr(tabr_mod, cls_name):
-                cls = getattr(tabr_mod, cls_name)
-                for kw in [{"num_features": n_feats}, {"in_features": n_feats}]:
-                    try:
-                        return cls(**kw)
-                    except Exception:
-                        pass
-
     return None
-
 
 def load_saved_importances(
     model_dirs=(
@@ -810,6 +945,7 @@ def load_saved_importances(
     n_feats=44,
     X_eval=None,
     y_eval=None,
+    exp_tag="bin_e1",
     device="cuda" if torch.cuda.is_available() else "cpu",
 ):
     """Scans directories, loads saved Tree, TabNet, and PyTorch DL models, and returns.
@@ -841,7 +977,11 @@ def load_saved_importances(
                     continue
                 for fname in os.listdir(d):
                     fn_lower = fname.lower()
-                    if any(s in fn_lower for s in search_names) and split in fn_lower:
+                    has_model_alias = any(s in fn_lower for s in search_names)
+                    has_split = split in fn_lower
+                    has_exp_tag = exp_tag is None or exp_tag.lower() in fn_lower
+
+                    if has_model_alias and has_split and has_exp_tag:
                         matched_path = os.path.join(d, fname)
                         break
                 if matched_path:
@@ -1224,38 +1364,12 @@ def plot_confusions(cm_dict, class_labels, title, ncols=None, normalize=True):
     plt.show()
 
 
-def imp_heatmap_x(imp_dict, feats, row_keys=None, title="Feature Importances"):
-    if row_keys is None:
-        row_keys = sorted(list(imp_dict.keys()))
-    row_keys = [k for k in row_keys if k in imp_dict]
-    if not row_keys:
-        print(f"[skip] {title}: no importances found")
-        return
-    M = np.vstack([np.asarray(imp_dict[k]) for k in row_keys]) * 100
-    df = pd.DataFrame(M, index=[_klabel(k) for k in row_keys], columns=feats)
-    df = df[df.mean(axis=0).sort_values(ascending=False).index]
-    fig, ax = plt.subplots(
-        figsize=(4 + 0.65 * len(df.columns), 2.5 + 0.9 * len(row_keys))
-    )
-    sns.heatmap(
-        df,
-        cmap="rocket_r",
-        annot=True,
-        fmt=".0f",
-        cbar_kws={"label": "share of gain / importance (%)", "shrink": 0.8},
-        annot_kws={"size": 11},
-        linewidths=0.5,
-        linecolor="white",
-        ax=ax,
-    )
-    ax.tick_params(length=0)
-    ax.set_title(title, pad=12)
-    ax.set_xlabel("")
-    ax.set_ylabel("")
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
-    ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
-    plt.tight_layout()
-    plt.show()
+def _clean_and_normalize(arr):
+    """Clamps negative permutation noise to 0 and normalizes vector to sum to 100%."""
+    a = np.nan_to_num(np.asarray(arr, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    a = np.maximum(0.0, a)  # Clamp negative noise to 0
+    total = np.sum(a)
+    return (a / total * 100.0) if total > 0 else a
 
 
 def imp_diff_heatmap(
@@ -1265,7 +1379,7 @@ def imp_diff_heatmap(
     title="Feature Gain Shift: Random vs. Temporal Split Protocol on Failure Prediction Task",
     per_model_scale=True,
 ):
-    """Renders heatmaps comparing (Temporal - Random) importance shift."""
+    """Renders heatmaps comparing (Temporal - Random) importance shift on a unified scale."""
     all_keys = list(imp_dict.keys())
     available_models = (
         set(k[0] for k in all_keys if isinstance(k, tuple))
@@ -1273,9 +1387,11 @@ def imp_diff_heatmap(
         else set(models)
     )
 
-    # Order rows according to PREFERRED_MODEL_ORDER
+    preferred_order = globals().get("PREFERRED_MODEL_ORDER", [])
+    display_names = globals().get("MODEL_DISPLAY_NAMES", {})
+
     ordered_models = []
-    for pref in PREFERRED_MODEL_ORDER:
+    for pref in preferred_order:
         for m in available_models:
             if m.lower() == pref and m not in ordered_models:
                 if (m, "random") in imp_dict and (m, "temporal") in imp_dict:
@@ -1291,11 +1407,17 @@ def imp_diff_heatmap(
 
     rows = {}
     for m in ordered_models:
-        delta = (
-            np.asarray(imp_dict[(m, "temporal")])
-            - np.asarray(imp_dict[(m, "random")])
-        ) * 100
-        disp_name = MODEL_DISPLAY_NAMES.get(m.lower(), m)
+        imp_rand = _clean_and_normalize(imp_dict[(m, "random")])
+        imp_temp = _clean_and_normalize(imp_dict[(m, "temporal")])
+
+        delta = imp_temp - imp_rand  # Difference in percentage points
+
+        # Max-Abs scaling per row: Maps each model's maximum shift to scale [-1.0, +1.0]
+        max_abs = np.nanmax(np.abs(delta))
+        if max_abs > 0:
+            delta = delta / max_abs
+
+        disp_name = display_names.get(m.lower(), m)
         rows[disp_name] = delta
 
     if not rows:
@@ -1307,108 +1429,62 @@ def imp_diff_heatmap(
     df = pd.DataFrame(rows).T
     df.columns = feats
 
-    # Filter out negligible features (< 0.2%) and sort by largest absolute shift
-    df = df.loc[:, df.abs().max(axis=0) >= 0.2]
+    # Filter out negligible features (< 0.1 on the [-1, +1] relative scale)
+    df = df.loc[:, df.abs().max(axis=0) >= 0.1]
     sorted_cols = df.abs().max(axis=0).sort_values(ascending=False).index
     df = df[sorted_cols]
 
-    n_models = len(df.index)
-
     sns.plotting_context("talk")
+    plt.rcParams.update({"font.family": "serif"})
+
+    lim = float(np.nanmax(np.abs(df.values))) or 1.0
+
+    fig, ax = plt.subplots(
+        figsize=(4 + 1.2 * len(df.columns), 2.5 + 1.1 * len(rows))
+    )
     
-    if per_model_scale:
-        fig, axes = plt.subplots(
-            n_models,
-            1,
-            figsize=(4 + 0.9 * len(df.columns), 1.5 * n_models + 1.2),
-            sharex=True,
-            squeeze=False,
-        )
+    sns.heatmap(
+        df,
+        cmap="coolwarm",  # Diverging colormap: Red (+1.0 max relative shift), Blue (-1.0)
+        center=0,
+        vmin=-1.0,
+        vmax=1.0,
+        annot=True,
+        fmt=".2f",
+        annot_kws={"size": 20},
+        cbar_kws={
+            "label": "Relative Shift (Δ / Max |Δ|)",
+            "shrink": 0.5,
+            "pad": 0.01,
+        },
+        linewidths=0.5,
+        linecolor="white",
+        ax=ax,
+    )
 
-        for i, model_name in enumerate(df.index):
-            ax = axes[i, 0]
-            row_df = df.loc[[model_name]]
-            lim = float(np.nanmax(np.abs(row_df.values))) or 1.0
-            is_last = i == n_models - 1
+    cbar = ax.collections[0].colorbar
+    cbar.set_ticks([-1.0, 0.0, 1.0])
+    cbar.ax.tick_params(labelsize=18)
+    cbar.set_label("Relative Shift (Δ / Max |Δ|)", fontsize=22, fontweight="bold", labelpad=12)
+    ax.tick_params(length=0)
+    ax.set_title(title, pad=15, fontsize=30)
+    ax.set_xlabel("")
+    ax.set_ylabel("")
 
-            sns.heatmap(
-                row_df,
-                cmap="vlag",
-                center=0,
-                vmin=-lim,
-                vmax=lim,
-                annot=True,
-                fmt=".2f",
-                annot_kws={"size": 16},
-                cbar_kws={
-                    "label": "Δ (%)",
-                    "shrink": 0.85,
-                    "pad": 0.01,
-                },
-                linewidths=0.5,
-                linecolor="white",
-                xticklabels=df.columns if is_last else False,
-                ax=ax,
-            )
-            ax.tick_params(length=0)
-            ax.set_ylabel("")
-            ax.set_yticklabels(
-                ax.get_yticklabels(), rotation=0, fontweight="bold", fontsize=20
-            )
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=22)
+    ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontweight="bold", fontsize=22)
+    plt.tight_layout()
 
-            if is_last:
-                ax.set_xticklabels(
-                    ax.get_xticklabels(), rotation=45, ha="right", fontsize=20
-                )
-            else:
-                ax.set_xlabel("")
+    notebook_dir = os.getcwd()
+    figures_dir = os.path.join(notebook_dir, "output")
+    os.makedirs(figures_dir, exist_ok=True)
 
-        fig.suptitle(title, y=1.02, fontsize=30)
-        plt.tight_layout()
-        plt.show()
+    pdf_path = os.path.join(figures_dir, "imp_diff_heatmap.pdf")
+    png_path = os.path.join(figures_dir, "imp_diff_heatmap.png")
 
-    else:
-        lim = float(np.nanmax(np.abs(df.values))) or 1.0
-        fig, ax = plt.subplots(
-            figsize=(4 + 0.95 * len(df.columns), 2.5 + 0.8 * len(rows))
-        )
-        sns.heatmap(
-            df,
-            cmap="vlag",
-            center=0,
-            vmin=-lim,
-            vmax=lim,
-            annot=True,
-            fmt=".2f",
-            annot_kws={"size": 13},
-            cbar_kws={
-                "label": "temporal - random gain (%)",
-                "shrink": 0.8,
-                "pad": 0.01,
-            },
-            linewidths=0.5,
-            linecolor="white",
-            ax=ax,
-        )
-        ax.tick_params(length=0)
-        ax.set_title(title, pad=12)
-        ax.set_xlabel("")
-        ax.set_ylabel("")
-
-        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
-        ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
-        plt.tight_layout()
-
-        notebook_dir = os.getcwd()
-        figures_dir = os.path.join(notebook_dir, "figures")
-        os.makedirs(figures_dir, exist_ok=True)
-
-        pdf_path = os.path.join(figures_dir, "imp_diff_heatmap.pdf")
-        png_path = os.path.join(figures_dir, "imp_diff_heatmap.png")
-
-        plt.savefig(pdf_path, bbox_inches="tight")
-        plt.savefig(png_path, bbox_inches="tight", dpi=300)
-        plt.show()
+    plt.savefig(pdf_path, bbox_inches="tight")
+    plt.savefig(png_path, bbox_inches="tight", dpi=300)
+    plt.show()
 
 
 if __name__ == "__main__":
