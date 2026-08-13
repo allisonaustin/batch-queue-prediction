@@ -1372,6 +1372,144 @@ def _clean_and_normalize(arr):
     return (a / total * 100.0) if total > 0 else a
 
 
+def imp_heatmap(
+    imp_dict: dict,
+    feats: list[str],
+    split_key: str = "temporal",
+    models: list[str] = None,
+    title: str = "Normalized Feature Importance",
+    cmap: str = "Blues",
+    min_importance_threshold: float = 0.1,
+    output_prefix: str = "temporal_imp_heatmap",
+):
+    all_keys = list(imp_dict.keys())
+    available_models = (
+        set(k[0] for k in all_keys if isinstance(k, tuple))
+        if models is None
+        else set(models)
+    )
+
+    preferred_order = globals().get("PREFERRED_MODEL_ORDER", [])
+    display_names = globals().get("MODEL_DISPLAY_NAMES", {})
+
+    # Order models according to preferred_order and available models
+    ordered_models = []
+    for pref in preferred_order:
+        for m in available_models:
+            if m.lower() == pref and m not in ordered_models:
+                if (m, split_key) in imp_dict:
+                    ordered_models.append(m)
+
+    for m in sorted(available_models):
+        if m not in ordered_models and (m, split_key) in imp_dict:
+            ordered_models.append(m)
+
+    rows = {}
+    for m in ordered_models:
+        val = imp_dict[(m, split_key)]
+
+        # Map numpy array, pandas Series, or dict to feature list
+        if isinstance(val, np.ndarray):
+            series = pd.Series(val, index=feats[: len(val)])
+        elif isinstance(val, (pd.Series, dict)):
+            series = pd.Series(val).reindex(feats)
+        else:
+            continue
+
+        series = series.fillna(0.0)
+
+        # Row-wise max-normalization: Maps each model's maximum importance to [0.0, 1.0]
+        max_val = np.nanmax(np.abs(series.values))
+        if max_val > 0:
+            series = series / max_val
+
+        disp_name = display_names.get(m.lower(), m)
+        rows[disp_name] = series
+
+    if not rows:
+        print(
+            f"[skip] {title}: no valid model data found for split '{split_key}'"
+        )
+        return
+
+    df = pd.DataFrame(rows).T
+    df.columns = feats
+
+    # Filter out features below the importance threshold across all models
+    if min_importance_threshold > 0:
+        df = df.loc[:, df.abs().max(axis=0) >= min_importance_threshold]
+
+    # Sort columns by maximum importance in descending order
+    sorted_cols = df.abs().max(axis=0).sort_values(ascending=False).index
+    df = df[sorted_cols]
+
+    # Global style updates
+    sns.plotting_context("talk")
+    plt.rcParams.update({"font.family": "serif"})
+
+    # Dynamic figure size matching imp_diff_heatmap proportions
+    fig, ax = plt.subplots(
+        figsize=(4 + 1.2 * len(df.columns), 2.5 + 1.1 * len(rows))
+    )
+
+    sns.heatmap(
+        df,
+        cmap=cmap,  # Sequential colormap for non-negative [0, 1] scale
+        vmin=0.0,
+        vmax=1.0,
+        annot=True,
+        fmt=".2f",
+        annot_kws={"size": 20},
+        cbar_kws={
+            "label": "Normalized Importance ($I / I_{\\max}$)",
+            "shrink": 0.5,
+            "pad": 0.01,
+        },
+        linewidths=0.5,
+        linecolor="white",
+        ax=ax,
+    )
+
+    # Colorbar formatting
+    cbar = ax.collections[0].colorbar
+    cbar.set_ticks([0.0, 0.5, 1.0])
+    cbar.ax.tick_params(labelsize=18)
+    cbar.set_label(
+        "Normalized Importance ($I / I_{\\max}$)",
+        fontsize=22,
+        fontweight="bold",
+        labelpad=12,
+    )
+
+    # Axis formatting
+    ax.tick_params(length=0)
+    ax.set_title(title, pad=15, fontsize=30)
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+
+    ax.set_xticklabels(
+        ax.get_xticklabels(), rotation=45, ha="right", fontsize=22
+    )
+    ax.set_yticklabels(
+        ax.get_yticklabels(), rotation=0, fontweight="bold", fontsize=22
+    )
+
+    plt.tight_layout()
+
+    # Save logic matching imp_diff_heatmap
+    notebook_dir = os.getcwd()
+    figures_dir = os.path.join(notebook_dir, "output")
+    os.makedirs(figures_dir, exist_ok=True)
+
+    pdf_path = os.path.join(figures_dir, f"{output_prefix}.pdf")
+    png_path = os.path.join(figures_dir, f"{output_prefix}.png")
+
+    plt.savefig(pdf_path, bbox_inches="tight")
+    plt.savefig(png_path, bbox_inches="tight", dpi=300)
+    plt.show()
+
+    return df
+
 def imp_diff_heatmap(
     imp_dict,
     feats,
