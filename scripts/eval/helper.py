@@ -1207,41 +1207,6 @@ def predict_reg_model(path, X_data, batch_size=32768, device=None):
     raise ValueError(f"Unrecognized model file format: {fname}")
 
 
-def campaign_breakdown(y_true, y_pred, campaign_ids, min_n=100, group_cols=None):
-    """Per-campaign wait-time error, for spotting which campaigns are easier
-    or harder to predict than the model's overall average. Campaigns with
-    fewer than `min_n` test jobs are dropped -- their error estimates are too
-    noisy to compare against campaigns with thousands of jobs.
-
-    `group_cols`: optional {name: row-aligned array} of extra categorical
-    columns to summarize per campaign (majority value among that campaign's
-    jobs) -- e.g. for coloring a campaign-level plot by some coarser
-    category. Since a campaign's own metadata columns are normally constant
-    across its jobs, majority-vote just recovers that constant value.
-    """
-    campaign_ids = np.asarray(campaign_ids)
-    ae = np.abs(np.asarray(y_pred, dtype=np.float64) - np.asarray(y_true, dtype=np.float64))
-    valid = ~np.isnan(campaign_ids) & (campaign_ids >= 0)
-    group_cols = group_cols or {}
-
-    out = {}
-    for cid in np.unique(campaign_ids[valid]):
-        m = valid & (campaign_ids == cid)
-        n = int(m.sum())
-        if n < min_n:
-            continue
-        entry = {
-            "n_jobs": n,
-            "median_ae_s": float(np.median(ae[m])),
-            "mean_ae_s": float(np.mean(ae[m])),
-        }
-        for name, arr in group_cols.items():
-            vals, counts = np.unique(np.asarray(arr)[m], return_counts=True)
-            entry[name] = float(vals[np.argmax(counts)])
-        out[int(cid)] = entry
-    return out
-
-
 def evaluate_wait_models(
     model_paths, X_test, y_test_raw, is_log_pred=True,
     campaign_ids=None, min_campaign_n=100, campaign_group_cols=None,
@@ -1370,6 +1335,275 @@ def _clean_and_normalize(arr):
     a = np.maximum(0.0, a)  # Clamp negative noise to 0
     total = np.sum(a)
     return (a / total * 100.0) if total > 0 else a
+
+def feature_split_imp_heatmap(
+    imp_dict: dict,
+    feats: list[str],
+    n_cat: int = None,  # Pass NCAT_MATCH or NCAT_SUB from meta
+    cards: dict | list = None,  # Pass cards from meta
+    cat_cols: list[str] = None,  # Explicit list of categorical feature names
+    cardinality_threshold: int = 50,  # Threshold if cards is a dict/list
+    split_key: str = "temporal",
+    models: list[str] = None,
+    title: str = "Normalized Feature Importance",
+    cmap: str = "Blues",
+    min_importance_threshold: float = 0.1,
+    output_prefix: str = "temporal_imp_side_by_side",
+):
+    """Renders two side-by-side heatmaps separating Categorical vs. Non-Categorical features
+
+    using schema metadata (n_cat, cards, or cat_cols).
+    """
+    all_keys = list(imp_dict.keys())
+    available_models = (
+        set(k[0] for k in all_keys if isinstance(k, tuple))
+        if models is None
+        else set(models)
+    )
+
+    preferred_order = globals().get("PREFERRED_MODEL_ORDER", [])
+    display_names = globals().get("MODEL_DISPLAY_NAMES", {})
+
+    # Order models according to preferred_order and available models
+    ordered_models = []
+    for pref in preferred_order:
+        for m in available_models:
+            if m.lower() == pref and m not in ordered_models:
+                if (m, split_key) in imp_dict:
+                    ordered_models.append(m)
+
+    for m in sorted(available_models):
+        if m not in ordered_models and (m, split_key) in imp_dict:
+            ordered_models.append(m)
+
+    rows = {}
+    for m in ordered_models:
+        val = imp_dict[(m, split_key)]
+
+        if isinstance(val, np.ndarray):
+            series = pd.Series(val, index=feats[: len(val)])
+        elif isinstance(val, (pd.Series, dict)):
+            series = pd.Series(val).reindex(feats)
+        else:
+            continue
+
+        series = series.fillna(0.0)
+
+        # Row-wise max-normalization
+        max_val = np.nanmax(np.abs(series.values))
+        if max_val > 0:
+            series = series / max_val
+
+        disp_name = display_names.get(m.lower(), m)
+        rows[disp_name] = series
+
+    if not rows:
+        print(
+            f"[skip] {title}: no valid model data found for split '{split_key}'"
+        )
+        return
+
+    df = pd.DataFrame(rows).T
+    df.columns = feats
+
+    # --- Step 1: Detect Categorical Features using Metadata ---
+    detected_cat = set()
+
+    if cat_cols is not None:
+        detected_cat = set(cat_cols)
+    elif n_cat is not None and isinstance(n_cat, int):
+        # The first n_cat columns in feats are categorical
+        detected_cat = set(feats[:n_cat])
+    elif cards is not None:
+        if isinstance(cards, dict):
+            for col in feats:
+                if col in cards and isinstance(cards[col], (int, float)):
+                    if cards[col] <= cardinality_threshold or cards[col] > 1:
+                        detected_cat.add(col)
+        elif isinstance(cards, (list, tuple, np.ndarray)):
+            for i, card_val in enumerate(cards):
+                if i < len(feats):
+                    detected_cat.add(feats[i])
+    else:
+        # Keyword-based fallback
+        cat_keywords = [
+            "group",
+            "owner",
+            "campaign",
+            "site",
+            "user",
+            "type",
+            "id",
+            "status",
+            "code",
+            "name",
+            "queue",
+            "vo",
+            "role",
+        ]
+        for col in feats:
+            if any(kw in col.lower() for kw in cat_keywords):
+                detected_cat.add(col)
+
+    cat_feats = [c for c in feats if c in detected_cat]
+    non_cat_feats = [c for c in feats if c not in detected_cat]
+
+    df_cat = df[cat_feats] if cat_feats else pd.DataFrame(index=df.index)
+    df_non_cat = (
+        df[non_cat_feats] if non_cat_feats else pd.DataFrame(index=df.index)
+    )
+
+    # --- Step 2: Apply Threshold & Sorting ---
+    if min_importance_threshold > 0:
+        if not df_cat.empty:
+            df_cat = df_cat.loc[
+                :, df_cat.abs().max(axis=0) >= min_importance_threshold
+            ]
+        if not df_non_cat.empty:
+            df_non_cat = df_non_cat.loc[
+                :, df_non_cat.abs().max(axis=0) >= min_importance_threshold
+            ]
+
+    if not df_cat.empty:
+        sort_cat = df_cat.abs().max(axis=0).sort_values(ascending=False).index
+        df_cat = df_cat[sort_cat]
+
+    if not df_non_cat.empty:
+        sort_non_cat = (
+            df_non_cat.abs().max(axis=0).sort_values(ascending=False).index
+        )
+        df_non_cat = df_non_cat[sort_non_cat]
+
+    if df_cat.empty and df_non_cat.empty:
+        print(f"[skip] {title}: all features fell below importance threshold")
+        return
+
+    # --- Step 3: Render Side-by-Side Figure ---
+    sns.plotting_context("talk")
+    plt.rcParams.update({"font.family": "serif"})
+
+    n_cat_cols = max(len(df_cat.columns), 1)
+    n_non_cat_cols = max(len(df_non_cat.columns), 1)
+    total_cols = n_cat_cols + n_non_cat_cols
+
+    fig, (ax1, ax2) = plt.subplots(
+        1,
+        2,
+        figsize=(5 + 1.2 * total_cols, 2.5 + 0.8 * len(rows)),
+        gridspec_kw={
+            "width_ratios": [n_cat_cols, n_non_cat_cols],
+            "wspace": 0.08,
+        },
+    )
+
+    # Plot 1: Categoricals
+    if not df_cat.empty:
+        sns.heatmap(
+            df_cat,
+            cmap=cmap,
+            vmin=0.0,
+            vmax=1.0,
+            annot=True,
+            fmt=".2f",
+            annot_kws={"size": 20},
+            cbar=False,
+            linewidths=0.5,
+            linecolor="white",
+            ax=ax1,
+        )
+        ax1.set_title(
+            "Categorical Features", pad=12, fontsize=24, fontweight="bold"
+        )
+    else:
+        ax1.text(
+            0.5,
+            0.5,
+            "No Categorical Features",
+            ha="center",
+            va="center",
+            fontsize=18,
+        )
+
+    # Plot 2: Continuous Features
+    if not df_non_cat.empty:
+        sns.heatmap(
+            df_non_cat,
+            cmap=cmap,
+            vmin=0.0,
+            vmax=1.0,
+            annot=True,
+            fmt=".2f",
+            annot_kws={"size": 20},
+            cbar_kws={
+                "label": "Normalized Importance ($I / I_{\\max}$)",
+                "shrink": 0.6,
+                "pad": 0.02,
+            },
+            linewidths=0.5,
+            linecolor="white",
+            ax=ax2,
+        )
+        ax2.set_title(
+            "Continuous Features",
+            pad=12,
+            fontsize=24,
+            fontweight="bold",
+        )
+    else:
+        ax2.text(
+            0.5,
+            0.5,
+            "No Continuous Features",
+            ha="center",
+            va="center",
+            fontsize=18,
+        )
+
+    # --- Formatting Axes ---
+    for ax in (ax1, ax2):
+        ax.tick_params(length=0)
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.set_xticklabels(
+            ax.get_xticklabels(), rotation=45, ha="right", fontsize=22
+        )
+
+    # Y-axis styling
+    ax1.set_yticklabels(
+        ax1.get_yticklabels(), rotation=0, fontweight="bold", fontsize=22
+    )
+    ax2.tick_params(
+        left=False, labelleft=False
+    )  # Hide duplicate Y-labels on right plot
+
+    # Colorbar styling
+    if not df_non_cat.empty and len(ax2.collections) > 0:
+        cbar = ax2.collections[0].colorbar
+        cbar.set_ticks([0.0, 0.5, 1.0])
+        cbar.ax.tick_params(labelsize=18)
+        cbar.set_label(
+            "Normalized Importance ($I / I_{\\max}$)",
+            fontsize=22,
+            fontweight="bold",
+            labelpad=12,
+        )
+
+    fig.suptitle(title, y=1.02, fontsize=30)
+    plt.tight_layout()
+
+    # Save logic
+    notebook_dir = os.getcwd()
+    figures_dir = os.path.join(notebook_dir, "output")
+    os.makedirs(figures_dir, exist_ok=True)
+
+    pdf_path = os.path.join(figures_dir, f"{output_prefix}.pdf")
+    png_path = os.path.join(figures_dir, f"{output_prefix}.png")
+
+    plt.savefig(pdf_path, bbox_inches="tight")
+    plt.savefig(png_path, bbox_inches="tight", dpi=300)
+    plt.show()
+
+    return df_cat, df_non_cat
 
 
 def imp_heatmap(
@@ -1511,13 +1745,33 @@ def imp_heatmap(
     return df
 
 def imp_diff_heatmap(
-    imp_dict,
-    feats,
-    models=None,
-    title="Feature Gain Shift: Random vs. Temporal Split Protocol on Failure Prediction Task",
-    per_model_scale=True,
+    imp_dict: dict,
+    feats: list[str],
+    n_cat: int = None,  # Pass NCAT_MATCH or NCAT_SUB from metadata
+    cards: dict | list = None,  # Pass cards from metadata
+    cat_cols: list[str] = None,  # Explicit list of categorical feature names
+    cardinality_threshold: int = 50,
+    models: list[str] = None,
+    title: str = "Feature Gain Shift: Random vs. Temporal Split Protocol",
+    min_importance_threshold: float = 0.1,  # Filters features with max absolute shift < 0.1
+    output_prefix: str = "imp_diff_heatmap_side_by_side",
 ):
-    """Renders heatmaps comparing (Temporal - Random) importance shift on a unified scale."""
+    """Renders heatmaps comparing (Temporal - Random) feature importance shifts,
+
+    optionally splitting columns side-by-side into Categorical vs.
+    Numerical/Dynamic features.
+    """
+
+    # Helper function to convert arrays/dicts to aligned pandas Series
+    def _clean_and_normalize(val):
+        if isinstance(val, np.ndarray):
+            series = pd.Series(val, index=feats[: len(val)])
+        elif isinstance(val, (pd.Series, dict)):
+            series = pd.Series(val).reindex(feats)
+        else:
+            series = pd.Series(0.0, index=feats)
+        return series.fillna(0.0)
+
     all_keys = list(imp_dict.keys())
     available_models = (
         set(k[0] for k in all_keys if isinstance(k, tuple))
@@ -1548,10 +1802,11 @@ def imp_diff_heatmap(
         imp_rand = _clean_and_normalize(imp_dict[(m, "random")])
         imp_temp = _clean_and_normalize(imp_dict[(m, "temporal")])
 
-        delta = imp_temp - imp_rand  # Difference in percentage points
+        # Feature gain shift (Temporal - Random)
+        delta = imp_temp - imp_rand
 
-        # Max-Abs scaling per row: Maps each model's maximum shift to scale [-1.0, +1.0]
-        max_abs = np.nanmax(np.abs(delta))
+        # Row-wise Max-Abs scaling: Maps each model's maximum shift to [-1.0, +1.0]
+        max_abs = np.nanmax(np.abs(delta.values))
         if max_abs > 0:
             delta = delta / max_abs
 
@@ -1567,62 +1822,237 @@ def imp_diff_heatmap(
     df = pd.DataFrame(rows).T
     df.columns = feats
 
-    # Filter out negligible features (< 0.1 on the [-1, +1] relative scale)
-    df = df.loc[:, df.abs().max(axis=0) >= 0.1]
-    sorted_cols = df.abs().max(axis=0).sort_values(ascending=False).index
-    df = df[sorted_cols]
+    # --- Step 1: Detect Categorical Features using Metadata or Heuristics ---
+    detected_cat = set()
 
+    if cat_cols is not None:
+        detected_cat = set(cat_cols)
+    elif n_cat is not None and isinstance(n_cat, int):
+        # The first n_cat columns in feats are categorical
+        detected_cat = set(feats[:n_cat])
+    elif cards is not None:
+        if isinstance(cards, dict):
+            for col in feats:
+                if col in cards and isinstance(cards[col], (int, float)):
+                    if cards[col] <= cardinality_threshold or cards[col] > 1:
+                        detected_cat.add(col)
+        elif isinstance(cards, (list, tuple, np.ndarray)):
+            for i, card_val in enumerate(cards):
+                if i < len(feats):
+                    detected_cat.add(feats[i])
+    else:
+        # Keyword-based fallback
+        cat_keywords = [
+            "group",
+            "owner",
+            "campaign",
+            "site",
+            "user",
+            "type",
+            "id",
+            "status",
+            "code",
+            "name",
+            "queue",
+            "vo",
+            "role",
+        ]
+        for col in feats:
+            if any(kw in col.lower() for kw in cat_keywords):
+                detected_cat.add(col)
+
+    cat_feats = [c for c in feats if c in detected_cat]
+    non_cat_feats = [c for c in feats if c not in detected_cat]
+
+    df_cat = df[cat_feats] if cat_feats else pd.DataFrame(index=df.index)
+    df_non_cat = (
+        df[non_cat_feats] if non_cat_feats else pd.DataFrame(index=df.index)
+    )
+
+    # --- Step 2: Apply Threshold & Sorting ---
+    if min_importance_threshold > 0:
+        if not df_cat.empty:
+            df_cat = df_cat.loc[
+                :, df_cat.abs().max(axis=0) >= min_importance_threshold
+            ]
+        if not df_non_cat.empty:
+            df_non_cat = df_non_cat.loc[
+                :, df_non_cat.abs().max(axis=0) >= min_importance_threshold
+            ]
+
+    if not df_cat.empty:
+        sort_cat = df_cat.abs().max(axis=0).sort_values(ascending=False).index
+        df_cat = df_cat[sort_cat]
+
+    if not df_non_cat.empty:
+        sort_non_cat = (
+            df_non_cat.abs().max(axis=0).sort_values(ascending=False).index
+        )
+        df_non_cat = df_non_cat[sort_non_cat]
+
+    if df_cat.empty and df_non_cat.empty:
+        print(
+            f"[skip] {title}: all features fell below shift threshold ({min_importance_threshold})"
+        )
+        return
+
+    # --- Step 3: Render Heatmap(s) ---
     sns.plotting_context("talk")
     plt.rcParams.update({"font.family": "serif"})
 
-    lim = float(np.nanmax(np.abs(df.values))) or 1.0
+    # Fallback to single subplot if all features fell into one category
+    if df_cat.empty or df_non_cat.empty:
+        df_single = df_cat if not df_cat.empty else df_non_cat
+        fig, ax = plt.subplots(
+            figsize=(4 + 1.2 * len(df_single.columns), 2.5 + 0.8 * len(rows))
+        )
 
-    fig, ax = plt.subplots(
-        figsize=(4 + 1.2 * len(df.columns), 2.5 + 1.1 * len(rows))
-    )
-    
-    sns.heatmap(
-        df,
-        cmap="coolwarm",  # Diverging colormap: Red (+1.0 max relative shift), Blue (-1.0)
-        center=0,
-        vmin=-1.0,
-        vmax=1.0,
-        annot=True,
-        fmt=".2f",
-        annot_kws={"size": 20},
-        cbar_kws={
-            "label": "Relative Shift (Δ / Max |Δ|)",
-            "shrink": 0.5,
-            "pad": 0.01,
-        },
-        linewidths=0.5,
-        linecolor="white",
-        ax=ax,
-    )
+        sns.heatmap(
+            df_single,
+            cmap="coolwarm",
+            center=0,
+            vmin=-1.0,
+            vmax=1.0,
+            annot=True,
+            fmt=".2f",
+            annot_kws={"size": 20},
+            cbar_kws={
+                "label": "Relative Shift (Δ / Max |Δ|)",
+                "shrink": 0.5,
+                "pad": 0.01,
+            },
+            linewidths=0.5,
+            linecolor="white",
+            ax=ax,
+        )
 
-    cbar = ax.collections[0].colorbar
-    cbar.set_ticks([-1.0, 0.0, 1.0])
-    cbar.ax.tick_params(labelsize=18)
-    cbar.set_label("Relative Shift (Δ / Max |Δ|)", fontsize=22, fontweight="bold", labelpad=12)
-    ax.tick_params(length=0)
-    ax.set_title(title, pad=15, fontsize=30)
-    ax.set_xlabel("")
-    ax.set_ylabel("")
+        cbar = ax.collections[0].colorbar
+        cbar.set_ticks([-1.0, 0.0, 1.0])
+        cbar.ax.tick_params(labelsize=18)
+        cbar.set_label(
+            "Relative Shift (Δ / Max |Δ|)",
+            fontsize=22,
+            fontweight="bold",
+            labelpad=12,
+        )
 
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right", fontsize=22)
-    ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontweight="bold", fontsize=22)
+        ax.tick_params(length=0)
+        ax.set_title(title, pad=15, fontsize=30)
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.set_xticklabels(
+            ax.get_xticklabels(), rotation=45, ha="right", fontsize=22
+        )
+        ax.set_yticklabels(
+            ax.get_yticklabels(), rotation=0, fontweight="bold", fontsize=22
+        )
+
+    else:
+        # Render Side-by-Side Subplots
+        n_cat_cols = len(df_cat.columns)
+        n_non_cat_cols = len(df_non_cat.columns)
+        total_cols = n_cat_cols + n_non_cat_cols
+
+        fig, (ax1, ax2) = plt.subplots(
+            1,
+            2,
+            figsize=(5 + 1.2 * total_cols, 2.5 + 0.8 * len(rows)),
+            gridspec_kw={
+                "width_ratios": [n_cat_cols, n_non_cat_cols],
+                "wspace": 0.08,
+            },
+        )
+
+        # Plot 1: Categorical Shift
+        sns.heatmap(
+            df_cat,
+            cmap="coolwarm",
+            center=0,
+            vmin=-1.0,
+            vmax=1.0,
+            annot=True,
+            fmt=".2f",
+            annot_kws={"size": 20},
+            cbar=False,
+            linewidths=0.5,
+            linecolor="white",
+            ax=ax1,
+        )
+        ax1.set_title(
+            "Categorical Features", pad=12, fontsize=24, fontweight="bold"
+        )
+
+        # Plot 2: Continuous Shift
+        sns.heatmap(
+            df_non_cat,
+            cmap="coolwarm",
+            center=0,
+            vmin=-1.0,
+            vmax=1.0,
+            annot=True,
+            fmt=".2f",
+            annot_kws={"size": 20},
+            cbar_kws={
+                "label": "Relative Shift (Δ / Max |Δ|)",
+                "shrink": 0.6,
+                "pad": 0.02,
+            },
+            linewidths=0.5,
+            linecolor="white",
+            ax=ax2,
+        )
+        ax2.set_title(
+            "Continuous Features",
+            pad=12,
+            fontsize=24,
+            fontweight="bold",
+        )
+
+        # Axis Formatting
+        for ax in (ax1, ax2):
+            ax.tick_params(length=0)
+            ax.set_xlabel("")
+            ax.set_ylabel("")
+            ax.set_xticklabels(
+                ax.get_xticklabels(), rotation=45, ha="right", fontsize=22
+            )
+
+        ax1.set_yticklabels(
+            ax1.get_yticklabels(), rotation=0, fontweight="bold", fontsize=22
+        )
+        ax2.tick_params(
+            left=False, labelleft=False
+        )  # Hide redundant Y labels on right subplot
+
+        # Colorbar Formatting
+        if len(ax2.collections) > 0:
+            cbar = ax2.collections[0].colorbar
+            cbar.set_ticks([-1.0, 0.0, 1.0])
+            cbar.ax.tick_params(labelsize=18)
+            cbar.set_label(
+                "Relative Shift (Δ / Max |Δ|)",
+                fontsize=22,
+                fontweight="bold",
+                labelpad=12,
+            )
+
+        fig.suptitle(title, y=1.03, fontsize=30)
+
     plt.tight_layout()
 
+    # Save logic
     notebook_dir = os.getcwd()
     figures_dir = os.path.join(notebook_dir, "output")
     os.makedirs(figures_dir, exist_ok=True)
 
-    pdf_path = os.path.join(figures_dir, "imp_diff_heatmap.pdf")
-    png_path = os.path.join(figures_dir, "imp_diff_heatmap.png")
+    pdf_path = os.path.join(figures_dir, f"{output_prefix}.pdf")
+    png_path = os.path.join(figures_dir, f"{output_prefix}.png")
 
     plt.savefig(pdf_path, bbox_inches="tight")
     plt.savefig(png_path, bbox_inches="tight", dpi=300)
     plt.show()
+
+    return df
 
 
 if __name__ == "__main__":
