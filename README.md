@@ -34,8 +34,8 @@ fife-batch-jobs/
 	├── feat-engineering.ipynb  	# Training and testing setup for job prediction tasks
 	└── pred-analysis.ipynb         # Job prediction result visualizations
 ├── .gitignore                      # Dataset and runtime configuration
-├── CLAUDE.md                       # Global instructions for Claude            
-├── FIFE-Docs.md                    # FIFE Batch Queue data documentation            
+├── CLAUDE.md                       # Global instructions for Claude          
+├── FIFE-Docs.md                    # FIFE Batch Queue data documentation          
 ├── MODELING.md                     # Detailed modeling design notes
 ├── README.md                       # Repo info
 └── config.json						# Dataset and runtime configuration
@@ -43,12 +43,24 @@ fife-batch-jobs/
 
 ### Requirements
 
-#### Dependencies
+#### Environment setup
 
-Install the required packages:
+1. Create a virtual environment
 
 ```
-pip install torch numpy pandas scikit-learn xgboost lightgbm catboost pytorch-tabnet matplotlib seaborn
+   python3 -m venv ~/envs/batch-eval
+```
+
+2. Activate
+
+```
+  source ~/envs/batch-eval/bin/activate
+```
+
+3. Install dependencies
+
+```
+  pip install --no-cache-dir -r requirements.txt
 ```
 
 #### Dataset(s)
