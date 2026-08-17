@@ -34,8 +34,8 @@ fife-batch-jobs/
 	├── feat-engineering.ipynb  	# Training and testing setup for job prediction tasks
 	└── pred-analysis.ipynb         # Job prediction result visualizations
 ├── .gitignore                      # Dataset and runtime configuration
-├── CLAUDE.md                       # Global instructions for Claude              
-├── FIFE-Docs.md                    # FIFE Batch Queue data documentation              
+├── CLAUDE.md                       # Global instructions for Claude            
+├── FIFE-Docs.md                    # FIFE Batch Queue data documentation            
 ├── MODELING.md                     # Detailed modeling design notes
 ├── README.md                       # Repo info
 └── config.json						# Dataset and runtime configuration
@@ -102,3 +102,19 @@ Precision, recall, F1, ROC-AUC, PR-AUC
 - within-2x ratio: proportion of predictions falling within a factor of 2 of actual wait times
 
 ### References
+
+Chen, T., & Guestrin, C. (2016). *XGBoost: A Scalable Tree Boosting System*. Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining, 785–794. [https://doi.org/10.1145/2939672.2939785](https://doi.org/10.1145/2939672.2939785)
+
+Ke, G., et al. (2017). *LightGBM: A Highly Efficient Gradient Boosting Decision Tree*. Advances in Neural Information Processing Systems (NeurIPS 30), 3146–3154.
+
+Prokhorenkova, L., et al. (2018). *CatBoost: unbiased boosting with categorical features*. Advances in Neural Information Processing Systems (NeurIPS 31), 6638–6648.
+
+Arik, S. O., & Pfister, T. (2021). *TabNet: Attentive Interpretable Tabular Learning*. Proceedings of the AAAI Conference on Artificial Intelligence, 35(8), 6679–6687. [https://arxiv.org/abs/1908.07442](https://arxiv.org/abs/1908.07442)
+
+Gorishniy, Y., Rubachev, I., Khrulkov, V., & Babenko, A. (2021). *Revisiting Deep Learning Models for Tabular Data*. Advances in Neural Information Processing Systems (NeurIPS 34), 18932–18943. [https://arxiv.org/abs/2106.11959](https://arxiv.org/abs/2106.11959)
+
+Somepalli, G., Goldblum, M., Suri, A., Geiping, J., & Goldstein, T. (2021). *SAINT: Improved Neural Networks for Tabular Data via Row Attention and Contrastive Pre-training*. arXiv preprint arXiv:2106.01342. [https://arxiv.org/abs/2106.01342](https://arxiv.org/abs/2106.01342)
+
+Chen, S. A., Li, C. L., Yoder, N., Sercu, T., & Pfister, T. (2023). *TSMixer: Lightweight MLP-Mixer for Multivariate Time Series Forecasting*. arXiv preprint arXiv:2303.06053. [https://arxiv.org/abs/2303.06053](https://arxiv.org/abs/2303.06053)
+
+Lovell, A., et al. (2024). *A Hierarchical Deep Learning Approach for Predicting Job Queue Times in HPC Systems*. IEEE/ACM International Conference for High Performance Computing, Networking, Storage and Analysis Workshops (SC24 Workshops).

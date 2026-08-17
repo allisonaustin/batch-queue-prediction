@@ -7,9 +7,9 @@ matrix reloaded from the saved training-data arrays (see
 `targets_and_masks.npz`) passed in separately since that column isn't
 one of the `XMATCH_COLS` feature columns.
 
-Defaults (date window, DR method, entity, point cap) live in `config.yaml`;
+Defaults (date window, DR method, entity, point cap) live in `config/config.yaml`;
 the feature columns used for DR + the importance panel live in
-`features.yaml`. Both are re-read on every `build_explorer()` call, so
+`config/features.yaml`. Both are re-read on every `build_explorer()` call, so
 editing them takes effect on the next cell run -- no code change needed.
 """
 
@@ -51,7 +51,7 @@ def _as_date(v):
 
 
 def load_config():
-    cfg = _load_yaml("FIFE_VIS_CONFIG", "config.yaml")
+    cfg = _load_yaml("FIFE_VIS_CONFIG", "config/config.yaml")
     defaults = {**(cfg.get("defaults") or {})}
     return {
         "defaults": defaults,
@@ -60,7 +60,7 @@ def load_config():
 
 
 def load_feature_list():
-    cfg = _load_yaml("FIFE_VIS_FEATURES", "features.yaml")
+    cfg = _load_yaml("FIFE_VIS_FEATURES", "config/features.yaml")
     return list(cfg.get("features") or [])
 
 
@@ -161,7 +161,7 @@ def _importance_html(df):
   if not imp:
     rows_html = (
         '<div style="color:#999;">No features configured -- edit'
-        " vis/features.yaml.</div>"
+        " vis/config/features.yaml.</div>"
     )
   else:
     max_score = max((s for _, s in imp), default=0.0) or 1.0
