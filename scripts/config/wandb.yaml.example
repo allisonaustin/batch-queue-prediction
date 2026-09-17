@@ -1,0 +1,15 @@
+# cp config/wandb.yaml.example config/wandb.yaml  and fill in entity + api_key.
+# config/wandb.yaml is gitignored. Anything omitted falls back to the defaults in
+# eval/wandb_logger.py. Override order: CLI > env > this file.
+
+enabled: false                  # true to log without passing --wandb
+project: fife-batch-jobs
+entity:                         # FILL IN: your W&B username or team
+api_key:                        # FILL IN: https://wandb.ai/authorize (or run `wandb login`)
+mode: online                    # online | offline (sync later) | disabled
+tags: []                        # extra tags; experiment/model/split/seed are automatic
+notes:                          # optional free-text note on every run
+
+log_epochs: true                # per-epoch loss curves from the neural models
+log_importance: true            # feature importance table
+log_tree_rounds: false          # per-round tree curves; needs an eval_set, costs a full pass

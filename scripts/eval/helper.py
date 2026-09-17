@@ -15,6 +15,7 @@ from sklearn.metrics import (
 )
 import matplotlib.pyplot as plt
 import seaborn as sns
+from eval.paths import DATA_ROOT, all_model_dirs as _all_model_dirs
 
 MODEL_DISPLAY_NAMES = {
     "xgboost": "XGBoost",
@@ -198,15 +199,167 @@ def cls_metrics_per_class(
     }
 
 
-def reg_metrics(y_true_log, pred_log):
-    """Computes honest wait time regression metrics on both log and original second scales."""
+# ---- Wait-time regimes and reference predictors ----
+#
+# Fitted by `fgmix` in data-analysis.ipynb: a 3-component lognormal mixture on
+# FermiGrid workflow jobs (pilots excluded, waits capped at 1 d), n = 47,794,160.
+# k = 3 sits at the BIC elbow -- the raw BIC argmin is 7, but the sweep flattens
+# after 3 and KS stops moving (0.0081 -> 0.0069). Medians are in seconds.
+WAIT_MIX = {
+    "site": "FermiGrid",
+    "k": 3,
+    "cap_s": 86_400.0,
+    "weights": [0.167, 0.450, 0.383],
+    "medians_s": [28.0, 779.0, 8988.0],
+    "sds_log": [1.566, 1.073, 1.064],
+    "ks": 0.0081,
+    "n": 47_794_160,
+}
+
+# Error-reporting strata, cut at the points where one mixture component overtakes
+# the next (106 s and 2,857 s, rounded to 2 min and 45 min) rather than at the
+# round numbers used before. Each stratum is a distinct queueing regime:
+#   inst -- matched into an already-idle pilot slot
+#   turn -- waiting for a slot to turn over
+#   prov -- waiting for new pilot provisioning
+#   park -- beyond the 1 d cap; parked behind a held workflow or a quota wall,
+#           kept as its own stratum rather than dropped so nothing is hidden
+WAIT_REGIMES = (
+    ("inst", 0.0, 120.0),
+    ("turn", 120.0, 2_700.0),
+    ("prov", 2_700.0, 86_400.0),
+    ("park", 86_400.0, np.inf),
+)
+
+
+def mixture_cdf_s(t, mix=None):
+    """Lognormal-mixture CDF evaluated at wait times `t` (seconds)."""
+    from scipy import stats as _st
+
+    mix = mix or WAIT_MIX
+    t = np.clip(np.atleast_1d(np.asarray(t, dtype=np.float64)), 1e-9, None)
+    lt = np.log(t)
+    return sum(
+        w * _st.norm.cdf(lt, np.log(m), s)
+        for w, m, s in zip(mix["weights"], mix["medians_s"], mix["sds_log"])
+    )
+
+
+def mixture_quantile_s(q, mix=None, lo=1e-3, hi=1e7, n=200_000):
+    """Inverts `mixture_cdf_s` on a log grid; returns wait times in seconds."""
+    mix = mix or WAIT_MIX
+    grid = np.logspace(np.log10(lo), np.log10(hi), n)
+    return np.interp(np.asarray(q, dtype=np.float64), mixture_cdf_s(grid, mix), grid)
+
+
+def pinball_loss(y_true_log, pred_log_by_tau):
+    """Mean pinball (quantile) loss in log1p space, averaged over the quantiles.
+
+    `pred_log_by_tau` maps tau -> row-aligned predictions. The mixture fit puts a
+    conditional SD of ~1.17 in log space even when the component is known, so a
+    point estimate is the wrong output object for this task; pinball is the loss a
+    set of quantile heads actually optimises, and it is what makes two interval
+    predictors comparable. Returns the per-tau losses and their mean.
+    """
+    y = np.asarray(y_true_log, dtype=np.float64)
+    per = {}
+    for tau, pred in sorted(pred_log_by_tau.items()):
+        d = y - np.asarray(pred, dtype=np.float64)
+        per[float(tau)] = float(np.mean(np.maximum(tau * d, (tau - 1.0) * d)))
+    return {"pinball_per_tau": per,
+            "pinball_mean": float(np.mean(list(per.values()))) if per else float("nan")}
+
+
+def interval_metrics(y_true_log, lo_log, hi_log):
+    """Coverage and width of a predicted interval, in log1p space.
+
+    `coverage` is the fraction of jobs whose true wait falls inside [lo, hi]; for
+    heads fitted at tau = 0.1/0.9 an honest model lands near 0.80. `width_log` is
+    the mean interval width in log1p units, so exp(width_log) is the multiplicative
+    factor the interval spans -- the number a user actually feels.
+    """
+    y = np.asarray(y_true_log, dtype=np.float64)
+    lo = np.asarray(lo_log, dtype=np.float64)
+    hi = np.asarray(hi_log, dtype=np.float64)
+    w = np.maximum(hi - lo, 0.0)
+    return {
+        "coverage": float(np.mean((y >= lo) & (y <= hi))),
+        "width_log": float(np.mean(w)),
+        "width_factor": float(np.exp(np.mean(w))),
+        "median_width_factor": float(np.exp(np.median(w))),
+    }
+
+
+def best_constant_log(y_true_log, metric="within2x"):
+    """The single best constant prediction under `metric`, as a log1p value.
+
+    This is the floor every E2 model has to clear. It matters because the wait
+    distribution is wide but unimodal in log space: a constant already scores
+    within2x ~ 0.25, so a model at 0.28 has bought almost nothing from its
+    features. `metric` is "within2x" (maximised) or "mae_log1p" (minimised, where
+    the answer is just the median).
+
+    For a constant prediction c (raw seconds) the within-2x set is an interval in
+    the true wait -- c <= 2T+1 and T <= 2c+1 means T in [(c-1)/2, 2c+1] -- so the
+    search is a pair of searchsorted lookups against the sorted labels rather than
+    a full pass per grid point. That difference matters: the training slice here
+    runs to tens of millions of rows.
+    """
+    y = np.asarray(y_true_log, dtype=np.float64)
+    if metric == "mae_log1p":
+        return float(np.median(y))
+    wt = np.sort(np.expm1(y))
+    grid_s = np.logspace(0, 5, 2000)
+    lo = np.searchsorted(wt, (grid_s - 1.0) / 2.0, side="left")
+    hi = np.searchsorted(wt, 2.0 * grid_s + 1.0, side="right")
+    return float(np.log1p(grid_s[int(np.argmax(hi - lo))]))
+
+
+def wait_reference_metrics(y_true_log_train, y_true_log_test):
+    """Scores the two no-feature reference predictors on the test slice.
+
+    Both are fitted on `y_true_log_train` only, so they are admissible baselines
+    rather than oracles:
+      - `constant`   : the best single number under within-2x
+      - `mixture_med`: the median of the fitted lognormal mixture (`WAIT_MIX`)
+    Report model metrics against these, not against zero -- an R2_log of 0.27 reads
+    very differently once the reader knows a constant already reaches within2x 0.25.
+    """
+    yte = np.asarray(y_true_log_test, dtype=np.float64)
+    out = {}
+    c = best_constant_log(y_true_log_train)
+    out["constant"] = {"pred_s": float(np.expm1(c)),
+                       **reg_metrics(yte, np.full_like(yte, c))}
+    m = float(np.log1p(mixture_quantile_s(0.5)))
+    out["mixture_med"] = {"pred_s": float(np.expm1(m)),
+                          **reg_metrics(yte, np.full_like(yte, m))}
+    return out
+
+
+def skill_score(model_value, reference_value, higher_is_better=True):
+    """Fraction of the reference predictor's headroom that the model closes.
+
+    1.0 is a perfect model, 0.0 is no better than the reference, negative is worse.
+    For error metrics (`higher_is_better=False`) this is 1 - model/reference.
+    """
+    m, r = float(model_value), float(reference_value)
+    if not higher_is_better:
+        return float("nan") if r == 0 else 1.0 - m / r
+    return float("nan") if r >= 1.0 else (m - r) / (1.0 - r)
+
+
+def reg_metrics(y_true_log, pred_log, legacy_bins=True):
+    """Computes honest wait time regression metrics on both log and original second scales.
+
+    Error is broken out by queueing regime (`WAIT_REGIMES`), whose boundaries come
+    from the fitted mixture's component crossovers rather than from round numbers.
+    `legacy_bins` additionally emits the older <10m / 10m-2h / >2h keys so entries
+    appended to results/wait_time_results.json before this change stay comparable --
+    the new keys are named separately so no existing key silently changes meaning.
+    """
     wt_true = np.expm1(y_true_log)
     wt_pred = np.clip(np.expm1(pred_log), 0, None)
     ae = np.abs(wt_pred - wt_true)
-
-    b_short = wt_true < 600
-    b_med = (wt_true >= 600) & (wt_true < 7200)
-    b_long = wt_true >= 7200
 
     # sMAPE on the raw second scale, symmetric so a 10x over- and
     # under-prediction cost the same. Jobs where both true and predicted wait
@@ -218,7 +371,7 @@ def reg_metrics(y_true_log, pred_log):
     if np.any(nonzero):
         smape_vals[nonzero] = np.abs(wt_true[nonzero] - wt_pred[nonzero]) / denom[nonzero]
 
-    return {
+    out = {
         "r2_log": float(r2_score(y_true_log, pred_log)),
         # Scale-free error in log1p space -- the space the models train in, so
         # this is the loss they actually optimize rather than a raw-second
@@ -230,15 +383,718 @@ def reg_metrics(y_true_log, pred_log):
             np.mean((wt_pred <= 2 * wt_true + 1) & (wt_true <= 2 * wt_pred + 1))
         ),
         "mae_raw_s": float(np.mean(ae)),
-        "mae_10m": float(ae[b_short].mean()) if b_short.any() else np.nan,
-        "mae_2h": float(ae[b_med].mean()) if b_med.any() else np.nan,
-        "mae_long": float(ae[b_long].mean()) if b_long.any() else np.nan,
-        # Median AE per bin, alongside the mean: wait times are heavily
-        # right-skewed within every bin too, so mean AE can look far worse
-        # than the error a typical job in that bin actually sees.
-        "median_ae_10m": float(np.median(ae[b_short])) if b_short.any() else np.nan,
-        "median_ae_2h": float(np.median(ae[b_med])) if b_med.any() else np.nan,
-        "median_ae_long": float(np.median(ae[b_long])) if b_long.any() else np.nan,
+    }
+
+    # Per-regime error. Mean AND median AE per stratum: waits are heavily
+    # right-skewed inside every stratum too, so mean AE can look far worse than
+    # the error a typical job in that stratum actually sees.
+    for name, lo, hi in WAIT_REGIMES:
+        b = (wt_true >= lo) & (wt_true < hi)
+        out[f"n_{name}"] = int(b.sum())
+        out[f"mae_{name}"] = float(ae[b].mean()) if b.any() else np.nan
+        out[f"median_ae_{name}"] = float(np.median(ae[b])) if b.any() else np.nan
+        out[f"within2x_{name}"] = float(
+            np.mean((wt_pred[b] <= 2 * wt_true[b] + 1) & (wt_true[b] <= 2 * wt_pred[b] + 1))
+        ) if b.any() else np.nan
+
+    if legacy_bins:
+        b_short = wt_true < 600
+        b_med = (wt_true >= 600) & (wt_true < 7200)
+        b_long = wt_true >= 7200
+        out.update({
+            "mae_10m": float(ae[b_short].mean()) if b_short.any() else np.nan,
+            "mae_2h": float(ae[b_med].mean()) if b_med.any() else np.nan,
+            "mae_long": float(ae[b_long].mean()) if b_long.any() else np.nan,
+            "median_ae_10m": float(np.median(ae[b_short])) if b_short.any() else np.nan,
+            "median_ae_2h": float(np.median(ae[b_med])) if b_med.any() else np.nan,
+            "median_ae_long": float(np.median(ae[b_long])) if b_long.any() else np.nan,
+        })
+    return out
+
+
+# ---- Reproducibility ----
+DEFAULT_SEED = 42
+
+
+def set_global_seed(seed=DEFAULT_SEED, deterministic=False):
+    """Seed every RNG a fit touches, so a run is reproducible from its seed alone.
+
+    Seeds Python, NumPy and Torch (CPU and all CUDA devices). Call this immediately
+    before constructing a model: the neural trainers draw their weight init, dropout
+    masks and batch shuffling from the global Torch RNG, so seeding here covers them
+    without threading a seed through every architecture.
+
+    `deterministic` additionally pins cuDNN to deterministic kernels. That makes a
+    single seed reproduce bit-for-bit, but it disables kernel autotuning and can cost
+    a large fraction of training throughput -- so it is off by default. Seed-to-seed
+    variance, which is what a spread across seeds measures, does not need it.
+    """
+    import random as _random
+
+    _random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    return int(seed)
+
+
+# ---- Test-set prediction persistence ----
+# The cascade, bootstrap intervals and seed-variance reporting all need the raw
+# test-set scores. Re-deriving them by reloading models is fragile -- the neural
+# trainers persist bare state_dicts, so reloading means reconstructing each
+# architecture -- and it is wasted compute. Every fit writes its scores once here.
+from eval.paths import PRED_ROOT as PRED_DIR
+
+
+def pred_path(exp_tag, lib, split, seed=DEFAULT_SEED, pred_dir=None):
+    d = pred_dir if pred_dir is not None else PRED_DIR
+    return os.path.join(d, f"{exp_tag}_{lib}_{split}_seed{seed}.npz")
+
+
+def save_predictions(exp_tag, lib, split, idx, probs, seed=DEFAULT_SEED, pred_dir=None,
+                     **extra):
+    """Persist test-set scores. `idx` are row indices into the full dataset."""
+    path = pred_path(exp_tag, lib, split, seed, pred_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savez_compressed(
+        path,
+        idx=np.asarray(idx, dtype=np.int64),
+        probs=np.asarray(probs, dtype=np.float32),
+        **extra,
+    )
+    print(f"[{lib}] Saved {len(probs):,} test predictions to {path}", flush=True)
+    return path
+
+
+def load_predictions(exp_tag, lib, split, seed=DEFAULT_SEED, pred_dir=None,
+                     calibrated=True):
+    """Returns (idx, probs) as written by `save_predictions`.
+
+    Prefers the calibrated scores when the run stored them, since composing two
+    uncalibrated stages reorders the cascade. Pass calibrated=False for the raw
+    model output.
+    """
+    path = pred_path(exp_tag, lib, split, seed, pred_dir)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No saved predictions at {path}. Re-run that experiment so the fit "
+            f"writes its test scores."
+        )
+    z = np.load(path)
+    key = "probs_cal" if (calibrated and "probs_cal" in z.files) else "probs"
+    return z["idx"], z[key]
+
+
+def align_predictions(idx_a, probs_a, idx_b, probs_b):
+    """Align two score vectors onto their shared rows, preserving idx_a's order.
+
+    The two cascade stages score different populations -- E1 covers every test job,
+    E3 only the ones it was asked about -- so composing them means intersecting on
+    row index rather than assuming the arrays line up positionally.
+    """
+    idx_a = np.asarray(idx_a)
+    idx_b = np.asarray(idx_b)
+    common = np.intersect1d(idx_a, idx_b, assume_unique=True)
+    return (
+        common,
+        np.asarray(probs_a)[np.searchsorted(idx_a, common)],
+        np.asarray(probs_b)[np.searchsorted(idx_b, common)],
+    )
+
+
+def cascade_metrics(y_hw, p_fail, p_hw_cond, thr_fail=None, thr_attr=None):
+    """Match-time hardware-fault detection as a two-stage cascade.
+
+    Scores every test job, not only the ones already known to have failed, so the
+    numbers describe a population a deployed system can actually assemble. The
+    composed score is P(failure) * P(hardware | failure); with calibrated stages
+    that is P(hardware), and it is a ranking score either way.
+
+    Reports three things a reviewer will ask for separately:
+
+    * `soft` -- threshold-free quality of the composed score over all test jobs.
+    * `stage1` -- what the failure detector costs the pipeline. Its recall on true
+      hardware faults is a hard ceiling on cascade recall: a hardware fault whose
+      job is not flagged as failing can never be attributed. This is where
+      first-stage error propagation becomes visible.
+    * `hard` -- the deployable rule, gate on P(failure) then attribute, at the
+      supplied operating points.
+
+    `p_fail_only` is the ablation: ranking by the failure score alone. If the
+    composed score does not beat it, the attribution stage is adding nothing at
+    match time, whatever its conditional metrics look like.
+    """
+    y_hw = np.asarray(y_hw).astype(np.int8)
+    p_fail = np.asarray(p_fail, dtype=np.float64)
+    p_hw_cond = np.asarray(p_hw_cond, dtype=np.float64)
+    n = int(len(y_hw))
+    score = p_fail * p_hw_cond
+
+    def _rank(s):
+        return {
+            "pr_auc": float(average_precision_score(y_hw, s)),
+            "roc_auc": float(roc_auc_score(y_hw, s)),
+        }
+
+    out = {
+        "n_test": n,
+        "n_hardware": int(y_hw.sum()),
+        # A random ranker scores exactly this AP, so it is the number every
+        # reported AP has to be read against.
+        "prevalence": float(y_hw.mean()),
+        "soft": _rank(score),
+        "p_fail_only": _rank(p_fail),
+        "p_attr_only": _rank(p_hw_cond),
+    }
+
+    if thr_fail is not None:
+        gate = p_fail >= thr_fail
+        caught = int((gate & (y_hw == 1)).sum())
+        out["stage1"] = {
+            "threshold": float(thr_fail),
+            "flagged": int(gate.sum()),
+            "flagged_frac": float(gate.mean()),
+            # Ceiling on anything the second stage can recover.
+            "hardware_recall_ceiling": float(caught / max(int(y_hw.sum()), 1)),
+        }
+        if thr_attr is not None:
+            pred = (gate & (p_hw_cond >= thr_attr)).astype(np.int8)
+            pr, rc, f1, _ = precision_recall_fscore_support(
+                y_hw, pred, average=None, labels=[0, 1], zero_division=0
+            )
+            out["hard"] = {
+                "threshold_fail": float(thr_fail),
+                "threshold_attr": float(thr_attr),
+                "precision": float(pr[1]),
+                "recall": float(rc[1]),
+                "f1": float(f1[1]),
+                "specificity": float(rc[0]),
+                "mcc": float(matthews_corrcoef(y_hw, pred)),
+                "alerts": int(pred.sum()),
+                "alert_frac": float(pred.mean()),
+            }
+    return out
+
+
+def bootstrap_ci(y_true, scores, metric="pr_auc", n_boot=200, seed=DEFAULT_SEED, alpha=0.05):
+    """Percentile bootstrap interval for a ranking metric on one test set.
+
+    Answers "is this gap larger than test-set noise?", which is a different
+    question from seed variance (see `aggregate_seeds`) -- this resamples the test
+    rows and holds the fit fixed, that one refits and holds the test set fixed. A
+    paper claiming one model beats another wants both.
+    """
+    y_true = np.asarray(y_true)
+    scores = np.asarray(scores)
+    fn = average_precision_score if metric == "pr_auc" else roc_auc_score
+    rng = np.random.default_rng(seed)
+    n = len(y_true)
+    vals = []
+    for _ in range(n_boot):
+        b = rng.integers(0, n, n)
+        yb = y_true[b]
+        # A resample with a single class leaves both metrics undefined.
+        if yb.min() == yb.max():
+            continue
+        vals.append(fn(yb, scores[b]))
+    vals = np.sort(vals)
+    return {
+        "point": float(fn(y_true, scores)),
+        "lo": float(np.quantile(vals, alpha / 2)) if len(vals) else float("nan"),
+        "hi": float(np.quantile(vals, 1 - alpha / 2)) if len(vals) else float("nan"),
+        "n_boot": int(len(vals)),
+    }
+
+
+def aggregate_seeds(runs, keys=None):
+    """Mean, std and range across repeated fits that differ only by seed.
+
+    `runs` is a list of metric dicts, one per seed. Nested per-class blocks are
+    flattened to "block.metric" so hardware/payload sub-metrics aggregate too.
+    Reporting std alongside the mean is what lets a reader tell an ordering that
+    reflects a real difference from one that is seed noise.
+    """
+    def _flat(d, prefix=""):
+        out = {}
+        for k, v in d.items():
+            if isinstance(v, dict):
+                out.update(_flat(v, f"{prefix}{k}."))
+            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                out[f"{prefix}{k}"] = float(v)
+        return out
+
+    flat = [_flat(r) for r in runs]
+    if not flat:
+        return {}
+    if keys is None:
+        keys = sorted(set().union(*(f.keys() for f in flat)))
+    agg = {"n_seeds": len(flat)}
+    for k in keys:
+        vals = np.array([f[k] for f in flat if k in f], dtype=np.float64)
+        if not len(vals):
+            continue
+        agg[k] = {
+            "mean": float(vals.mean()),
+            # Sample std (ddof=1): these are a sample of seeds, not the population.
+            "std": float(vals.std(ddof=1)) if len(vals) > 1 else 0.0,
+            "min": float(vals.min()),
+            "max": float(vals.max()),
+            "n": int(len(vals)),
+        }
+    return agg
+
+
+def collect_seed_runs(exp_name, lib, split, results_dir=None):
+    """Gather every seed's metrics for one model/split out of a results JSON.
+
+    Repeated runs are stored under "<split>" (the default seed) and
+    "<split>__seed<N>" (the rest), so this pulls them back together for
+    `aggregate_seeds`.
+    """
+    results_dir = results_dir if results_dir is not None else os.path.join(os.getcwd(), "results")
+    path = os.path.join(results_dir, f"{exp_name}_results.json")
+    with open(path) as f:
+        data = json.load(f)
+    entry = data.get(lib, {})
+    runs = [v for k, v in entry.items() if k == split or k.startswith(f"{split}__seed")]
+    return runs
+
+
+def seed_summary_table(exp_name, libs, split, metrics, results_dir=None):
+    """mean +/- std across seeds, one row per model -- the variance table a paper needs.
+
+    `metrics` are dotted paths into the metric dict, e.g. "hardware.pr_auc".
+    Models fitted under a single seed report std 0.0 with n=1, which is a placeholder
+    and not evidence of stability; report the seed count alongside.
+    """
+    rows = {}
+    for lib in libs:
+        runs = collect_seed_runs(exp_name, lib, split, results_dir)
+        if not runs:
+            continue
+        agg = aggregate_seeds(runs)
+        rows[lib] = {m: agg.get(m) for m in metrics}
+        rows[lib]["n_seeds"] = agg.get("n_seeds", 0)
+    return rows
+
+
+# ---- Temporal partitioning on label-observation time ----
+def terminal_time(completion, job_start=None, wall_clock=None, qdate=None, floor=None):
+    """When each job's outcome became observable, as an epoch-seconds array.
+
+    Splitting on submission time cannot simulate a model deployed at the cutoff: a job
+    submitted in June that terminates in July carries a label nobody could have known.
+    The observation time is the job's terminal event, resolved in order of how directly
+    it is recorded:
+
+      1. CompletionDate, where present (86% of jobs);
+      2. JobStartDate + RemoteWallClockTime, for jobs that ran but were removed rather
+         than completing (2.6%);
+      3. QDate, for jobs removed before ever starting (11.2%).
+
+    Case 3 is a LOWER BOUND, not an observation -- HTCondor does not record a removal
+    timestamp for a job that never ran. Those jobs land on the training side by their
+    queue time, so a job queued shortly before the cutoff and removed shortly after is
+    still mis-assigned. The exposure is bounded and should be reported: quote the count
+    of fallback-assigned training jobs queued within the removal window of the cutoff.
+    """
+    out = np.asarray(completion, dtype=np.float64).copy()
+    ok = np.isfinite(out) & (out > 0)
+    if floor is not None:
+        ok &= out >= floor
+    src = np.where(ok, 0, -1)
+
+    if job_start is not None and wall_clock is not None:
+        js = np.asarray(job_start, dtype=np.float64)
+        wc = np.asarray(wall_clock, dtype=np.float64)
+        can = (~ok) & np.isfinite(js) & (js > 0) & np.isfinite(wc) & (wc > 0)
+        if floor is not None:
+            can &= js >= floor
+        out[can] = js[can] + wc[can]; src[can] = 1; ok |= can
+
+    if qdate is not None:
+        q = np.asarray(qdate, dtype=np.float64)
+        can = (~ok) & np.isfinite(q) & (q > 0)
+        out[can] = q[can]; src[can] = 2; ok |= can
+
+    out[~ok] = np.nan
+    return out, src
+
+
+def temporal_masks(qs, cutoff, label_time=None, verbose=True):
+    """Partition on when each label became observable, not on when the job was queued.
+
+    Training is every job whose outcome was already known at the cutoff; the test set
+    is everything still outstanding, which includes boundary jobs -- queued before the
+    cutoff, terminating after it. Those are predictions a model deployed at the cutoff
+    would still have had open, so they belong on the evaluation side rather than being
+    discarded. No training label can post-date the cutoff by construction.
+
+    Falls back to splitting on `qs` when no `label_time` is supplied.
+    """
+    qs = np.asarray(qs, dtype=np.float64)
+    if label_time is None:
+        train, test = qs < cutoff, qs >= cutoff
+        stats = {"n_train": int(train.sum()), "n_test": int(test.sum()), "basis": "qdate"}
+    else:
+        lt = np.asarray(label_time, dtype=np.float64)
+        usable = np.isfinite(lt)
+        # Unresolvable terminal time: fall back to queue time so no job is dropped.
+        eff = np.where(usable, lt, qs)
+        train, test = eff < cutoff, eff >= cutoff
+        stats = {
+            "n_train": int(train.sum()), "n_test": int(test.sum()), "basis": "label_time",
+            "n_moved_to_test": int((train | test).sum() and ((qs < cutoff) & test).sum()),
+            "n_unresolved": int((~usable).sum()),
+        }
+    assert not (train & test).any() and (train | test).all(), "partition must cover all rows once"
+    if verbose:
+        extra = ""
+        if stats["basis"] == "label_time":
+            extra = (f" | {stats['n_moved_to_test']:,} boundary jobs moved to test"
+                     f" | {stats['n_unresolved']:,} rows fell back to queue time")
+        print(f"[temporal split] train {stats['n_train']:,} | test {stats['n_test']:,}{extra}",
+              flush=True)
+    return train, test, stats
+
+
+# ---- Entity memorization ----
+def entity_seen_mask(entity, train_mask, test_mask):
+    """Boolean over the TEST rows: True where that entity also occurs in training.
+
+    Splitting the test set this way measures entity memorization without retraining
+    and without changing the time period, which is what separates it from the
+    random-vs-temporal gap.
+    """
+    entity = np.asarray(entity)
+    seen = set(np.unique(entity[np.asarray(train_mask, dtype=bool)]).tolist())
+    return np.array([e in seen for e in entity[np.asarray(test_mask, dtype=bool)]], dtype=bool)
+
+
+def entity_memorization(y_true, probs, seen, entity_name="entity", min_n=1000):
+    """Compare performance on test jobs from seen vs. unseen entities.
+
+    Both subsets come from the same test period and the same trained model, so
+    chronology, drift and training data are all held constant and the remaining gap
+    is attributable to entity familiarity rather than to the four things that move
+    at once between a random and a temporal split.
+
+    Leads on ROC AUC deliberately: the two subsets typically differ sharply in class
+    prevalence, and average precision moves with prevalence while ROC AUC does not.
+    AP is reported alongside as a lift over each subset's own base rate, which is the
+    only way it can be compared across subsets at all.
+    """
+    y_true = np.asarray(y_true).astype(np.int8)
+    probs = np.asarray(probs, dtype=np.float64)
+    seen = np.asarray(seen, dtype=bool)
+
+    out = {"entity": entity_name}
+    for name, m in (("seen", seen), ("unseen", ~seen)):
+        n = int(m.sum())
+        blk = {"n": n, "frac": float(m.mean())}
+        if n >= min_n and len(np.unique(y_true[m])) == 2:
+            prev = float(y_true[m].mean())
+            ap = float(average_precision_score(y_true[m], probs[m]))
+            blk.update({
+                "prevalence": prev,
+                "roc_auc": float(roc_auc_score(y_true[m], probs[m])),
+                "pr_auc": ap,
+                "pr_auc_lift": ap / prev if prev > 0 else float("nan"),
+            })
+        else:
+            blk["skipped"] = "too few rows or single-class subset"
+        out[name] = blk
+
+    if "roc_auc" in out["seen"] and "roc_auc" in out["unseen"]:
+        out["delta_roc_auc"] = out["seen"]["roc_auc"] - out["unseen"]["roc_auc"]
+        out["delta_pr_auc_lift"] = out["seen"]["pr_auc_lift"] - out["unseen"]["pr_auc_lift"]
+    return out
+
+
+# Resolved against XMATCH_COLS / XSUB_COLS by name, so a feature-layout change
+# surfaces as a missing entity rather than a silently wrong column.
+COLD_START_ENTITIES = (
+    ("group", "Group"),
+    ("user", "Owner"),
+    ("campaign", "CampaignName"),
+    ("campaign_stage", "CampaignStageName"),
+    ("site", "MatchSite"),
+)
+
+
+def entity_columns(X, cols, wanted=COLD_START_ENTITIES):
+    """Entity code vectors from a feature matrix, by column name. Entities absent
+    from the matrix (MatchSite is not known at submit time) are skipped, not faked."""
+    idx = {c: i for i, c in enumerate(cols)}
+    out = {}
+    for label, name in wanted:
+        if name in idx:
+            out[label] = np.asarray(X[:, idx[name]]).ravel()
+    return out
+
+
+def subgroup_metrics(y_true, probs, codes, kind="bin", min_n=1000, top_k=12):
+    """Per-subgroup metrics for the largest `top_k` levels; smaller levels pool into
+    "other". Matters here because FermiGrid runs ~88% of jobs, so an aggregate score
+    can look strong while every small site fails."""
+    y_true = np.asarray(y_true)
+    probs = np.asarray(probs, dtype=np.float64)
+    codes = np.asarray(codes)
+    lv, cnt = np.unique(codes, return_counts=True)
+    order = np.argsort(cnt)[::-1]
+    keep = [lv[i] for i in order[:top_k] if cnt[i] >= min_n]
+
+    rows = {}
+    covered = np.zeros(len(codes), dtype=bool)
+    for level in keep:
+        m = codes == level
+        covered |= m
+        rows[str(int(level))] = _subgroup_block(y_true[m], probs[m], kind)
+    if (~covered).any():
+        rows["other"] = _subgroup_block(y_true[~covered], probs[~covered], kind)
+    return rows
+
+
+def _subgroup_block(y, p, kind):
+    """One subgroup's metrics; classification and regression handled separately."""
+    n = int(len(y))
+    blk = {"n": n}
+    if n == 0:
+        return blk
+    if kind == "reg":
+        blk.update(reg_metrics(y, p, legacy_bins=False))
+        return blk
+    blk["prevalence"] = float(np.mean(y))
+    if len(np.unique(y)) < 2:
+        blk["skipped"] = "single-class subgroup"
+        return blk
+    ap = float(average_precision_score(y, p))
+    blk.update({
+        "roc_auc": float(roc_auc_score(y, p)),
+        "pr_auc": ap,
+        # AP moves with prevalence, so across subgroups with different base rates
+        # only the lift over each subgroup's own base rate is comparable.
+        "pr_auc_lift": ap / blk["prevalence"] if blk["prevalence"] > 0 else float("nan"),
+    })
+    return blk
+
+
+def cold_start_report(y_true, probs, X, cols, train_idx, test_idx, kind="bin",
+                      entities=COLD_START_ENTITIES, min_n=1000, top_k=12,
+                      verbose=True):
+    """Cold-start and subgroup behaviour for one fitted model on one split.
+
+    Both are measured on the same test period with the same fitted model, so unlike
+    the random-vs-temporal gap neither is confounded by drift. Post-hoc: call it with
+    predictions loaded from disk (`load_predictions`).
+
+    Returns {entity_label: {"cold_start": ..., "subgroups": ...}}.
+    """
+    train_idx = np.asarray(train_idx)
+    test_idx = np.asarray(test_idx)
+    ent_all = entity_columns(X, cols, entities)
+    out = {}
+    for label, codes_all in ent_all.items():
+        tr_codes = codes_all[train_idx]
+        te_codes = codes_all[test_idx]
+        seen_levels = set(np.unique(tr_codes).tolist())
+        seen = np.fromiter((c in seen_levels for c in te_codes), dtype=bool,
+                           count=len(te_codes))
+        block = {
+            "n_levels_train": int(len(seen_levels)),
+            "n_levels_test": int(len(np.unique(te_codes))),
+            "n_levels_unseen": int(len(set(np.unique(te_codes).tolist()) - seen_levels)),
+        }
+        if kind == "reg":
+            block["cold_start"] = _cold_start_reg(y_true, probs, seen, label, min_n)
+        else:
+            block["cold_start"] = entity_memorization(y_true, probs, seen,
+                                                      entity_name=label, min_n=min_n)
+        block["subgroups"] = subgroup_metrics(y_true, probs, te_codes, kind=kind,
+                                              min_n=min_n, top_k=top_k)
+        out[label] = block
+        if verbose:
+            cs = block["cold_start"]
+            u = cs.get("unseen", {})
+            s = cs.get("seen", {})
+            head = (f"  {label:15s} levels tr/te/unseen "
+                    f"{block['n_levels_train']}/{block['n_levels_test']}/"
+                    f"{block['n_levels_unseen']}")
+            if kind == "reg":
+                print(f"{head}  seen R2 {s.get('r2_log', float('nan')):+.3f} "
+                      f"(n={s.get('n', 0):,})  unseen R2 "
+                      f"{u.get('r2_log', float('nan')):+.3f} (n={u.get('n', 0):,})",
+                      flush=True)
+            else:
+                print(f"{head}  seen AUC {s.get('roc_auc', float('nan')):.3f} "
+                      f"(n={s.get('n', 0):,})  unseen AUC "
+                      f"{u.get('roc_auc', float('nan')):.3f} (n={u.get('n', 0):,})  "
+                      f"delta {cs.get('delta_roc_auc', float('nan')):+.3f}", flush=True)
+    return out
+
+
+def _cold_start_reg(y_true, pred, seen, entity_name, min_n):
+    """Regression counterpart of `entity_memorization` for the wait-time task."""
+    y_true = np.asarray(y_true, dtype=np.float64)
+    pred = np.asarray(pred, dtype=np.float64)
+    seen = np.asarray(seen, dtype=bool)
+    out = {"entity": entity_name}
+    for name, m in (("seen", seen), ("unseen", ~seen)):
+        n = int(m.sum())
+        blk = {"n": n, "frac": float(m.mean())}
+        if n >= min_n:
+            blk.update(reg_metrics(y_true[m], pred[m], legacy_bins=False))
+        else:
+            blk["skipped"] = "too few rows"
+        out[name] = blk
+    for k in ("r2_log", "mae_log1p", "within2x"):
+        if k in out["seen"] and k in out["unseen"]:
+            out[f"delta_{k}"] = out["seen"][k] - out["unseen"][k]
+    return out
+
+
+def matched_test_masks(qs, cutoff, label_time=None, test_frac=0.5, seed=DEFAULT_SEED,
+                       verbose=True):
+    """Two training protocols scored on one identical test set.
+
+    The random-vs-temporal gap as usually run moves four things at once: chronology,
+    the test population, its class prevalence, and entity overlap. Attributing the
+    whole gap to memorization is therefore not supported.
+
+    This holds the evaluation set fixed. A random half of the post-cutoff period is
+    reserved as the test set for BOTH protocols; the other half stays available for
+    training. The two training pools are then subsampled to an identical size, so
+    the only thing that differs between them is whether training contains jobs
+    contemporaneous with the test period:
+
+      train_honest  -- pre-cutoff jobs only (temporally honest)
+      train_leaky   -- pre-cutoff jobs plus the post-cutoff jobs held out of the test
+
+    Any remaining gap cannot be explained by a different test population, a different
+    base rate, or a different test size, because all three are identical by
+    construction.
+    """
+    qs = np.asarray(qs, dtype=np.float64)
+    pre, post = qs < cutoff, qs >= cutoff
+
+    rng = np.random.default_rng(seed)
+    post_idx = np.where(post)[0]
+    perm = rng.permutation(len(post_idx))
+    n_test = int(round(test_frac * len(post_idx)))
+    test_idx = np.sort(post_idx[perm[:n_test]])
+    post_train_idx = np.sort(post_idx[perm[n_test:]])
+
+    test = np.zeros_like(pre); test[test_idx] = True
+
+    honest_pool = pre.copy()
+    if label_time is not None:
+        lt = np.asarray(label_time, dtype=np.float64)
+        usable = np.isfinite(lt) & (lt > 0)
+        honest_pool &= ~(usable & (lt >= cutoff))
+
+    leaky_pool = honest_pool.copy(); leaky_pool[post_train_idx] = True
+
+    # Match training size so the comparison is not confounded by sample size.
+    n_match = int(min(honest_pool.sum(), leaky_pool.sum()))
+    def _subsample(mask):
+        idx = np.where(mask)[0]
+        if len(idx) <= n_match:
+            return mask
+        keep = np.sort(rng.choice(idx, n_match, replace=False))
+        out = np.zeros_like(mask); out[keep] = True
+        return out
+
+    train_honest, train_leaky = _subsample(honest_pool), _subsample(leaky_pool)
+    stats = {
+        "n_test": int(test.sum()),
+        "n_train_honest": int(train_honest.sum()),
+        "n_train_leaky": int(train_leaky.sum()),
+        "n_post_in_leaky_train": int(train_leaky[post_train_idx].sum()),
+    }
+    assert not (train_honest & test).any() and not (train_leaky & test).any(), "test leaked into train"
+    if verbose:
+        print(f"[matched-test split] test {stats['n_test']:,} (identical for both protocols) | "
+              f"train honest {stats['n_train_honest']:,} | train leaky "
+              f"{stats['n_train_leaky']:,} of which {stats['n_post_in_leaky_train']:,} "
+              f"are contemporaneous with the test period", flush=True)
+    return train_honest, train_leaky, test, stats
+
+
+# ---- Probability calibration ----
+def fit_calibrator(p_val, y_val, method="isotonic", clip=1e-6):
+    """Fit a calibrator on the held-out slice and return a callable score -> probability.
+
+    Both cascade stages are fitted with `scale_pos_weight`, which deliberately distorts
+    their output away from the true posterior. That is harmless for a single stage --
+    ranking metrics are invariant to any monotone transform -- but it breaks the
+    composition: the product of two monotonically distorted scores is NOT a monotone
+    function of the product of the true probabilities, so an uncalibrated cascade
+    reorders jobs relative to a calibrated one. Calibrating each stage makes
+    P(failure) * P(hardware | failure) an actual probability rather than a heuristic.
+
+    Fitted on the same held-out slice used for threshold selection, which the model was
+    not fitted on and which carries the natural (unweighted) class balance.
+
+    'isotonic' is a monotone step fit -- flexible, needs a few thousand positives.
+    'platt' is a one-parameter sigmoid on the logit -- stiffer, safer when positives
+    are scarce.
+    """
+    p_val = np.clip(np.asarray(p_val, dtype=np.float64), clip, 1 - clip)
+    y_val = np.asarray(y_val).astype(np.int8)
+    if len(np.unique(y_val)) < 2:
+        return lambda p: np.asarray(p, dtype=np.float64)
+
+    if method == "isotonic":
+        from sklearn.isotonic import IsotonicRegression
+        ir = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        ir.fit(p_val, y_val)
+        return lambda p: ir.predict(np.clip(np.asarray(p, dtype=np.float64), clip, 1 - clip))
+
+    if method == "platt":
+        from sklearn.linear_model import LogisticRegression
+        lr = LogisticRegression(C=1e10, solver="lbfgs")
+        lr.fit(np.log(p_val / (1 - p_val)).reshape(-1, 1), y_val)
+        def _apply(p):
+            p = np.clip(np.asarray(p, dtype=np.float64), clip, 1 - clip)
+            return lr.predict_proba(np.log(p / (1 - p)).reshape(-1, 1))[:, 1]
+        return _apply
+
+    raise ValueError(f"unknown calibration method: {method!r}")
+
+
+def calibration_report(y_true, p_raw, p_cal, n_bins=10):
+    """Brier score and expected calibration error, before and after.
+
+    Brier and ECE both move with calibration; ROC AUC does not, because a monotone
+    map cannot change the ranking. Seeing AUC hold constant while Brier falls is the
+    confirmation that the calibrator fixed the probabilities without disturbing the
+    ordering.
+    """
+    y = np.asarray(y_true).astype(np.float64)
+
+    def _ece(p):
+        p = np.asarray(p, dtype=np.float64)
+        edges = np.linspace(0, 1, n_bins + 1)
+        idx = np.clip(np.digitize(p, edges[1:-1]), 0, n_bins - 1)
+        tot = 0.0
+        for b in range(n_bins):
+            m = idx == b
+            if m.any():
+                tot += m.mean() * abs(p[m].mean() - y[m].mean())
+        return float(tot)
+
+    return {
+        "brier_raw": float(np.mean((np.asarray(p_raw) - y) ** 2)),
+        "brier_cal": float(np.mean((np.asarray(p_cal) - y) ** 2)),
+        "ece_raw": _ece(p_raw),
+        "ece_cal": _ece(p_cal),
+        "mean_pred_raw": float(np.mean(p_raw)),
+        "mean_pred_cal": float(np.mean(p_cal)),
+        "base_rate": float(y.mean()),
     }
 
 
@@ -495,11 +1351,7 @@ def evaluate_protocol_models(
     rte,
     tri_t,
     tei_t,
-    model_dirs=(
-        "/mnt/scratch/fast0/amaustin/dl-tabular-models",
-        "/mnt/scratch/fast0/amaustin/tree-models",
-        "/mnt/scratch/fast0/amaustin/models",
-    ),
+    model_dirs=None,
     preferred_models=PREFERRED_MODEL_ORDER,
     batch_size=32768,
     exp_tag="bin_e1",
@@ -529,7 +1381,7 @@ def evaluate_protocol_models(
             matched_paths = {}
 
             for split in ["random", "temporal"]:
-                for d in model_dirs:
+                for d in (model_dirs or _all_model_dirs()):
                     if not os.path.exists(d):
                         continue
                     for fname in sorted(os.listdir(d)):
@@ -925,11 +1777,7 @@ def _instantiate_pytorch_model(m_name, n_feats, state_dict=None):
     return None
 
 def load_saved_importances(
-    model_dirs=(
-        "/mnt/scratch/fast0/amaustin/models",
-        "/mnt/scratch/fast0/amaustin/tree-models",
-        "/mnt/scratch/fast0/amaustin/dl-tabular-models",
-    ),
+    model_dirs=None,
     models=(
         "xgboost",
         "lightgbm",
@@ -972,7 +1820,7 @@ def load_saved_importances(
         for split in splits:
             matched_path = None
 
-            for d in model_dirs:
+            for d in (model_dirs or _all_model_dirs()):
                 if not os.path.exists(d):
                     continue
                 for fname in os.listdir(d):
@@ -2056,7 +2904,7 @@ def imp_diff_heatmap(
 
 
 if __name__ == "__main__":
-    DATA_DIR = "/mnt/scratch/fast0/amaustin/datasets/fife/"
+    DATA_DIR = DATA_ROOT
     targets = np.load(os.path.join(DATA_DIR, "targets_and_masks.npz"))
 
     Xmatch = np.load(os.path.join(DATA_DIR, "Xmatch.npy"), mmap_mode="r")

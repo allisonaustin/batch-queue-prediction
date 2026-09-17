@@ -8,9 +8,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score, r2_score, roc_auc_score
 from eval.helper import _empty_gpu, _get_slice
+from eval.wandb_logger import log_epoch
+from eval.paths import model_path
 
-model_dir = "/mnt/scratch/fast0/amaustin/dl-tabular-models"
-os.makedirs(model_dir, exist_ok=True)
 
 class Attention(nn.Module):
     """Fast Feature Attention using PyTorch 2.0+ Scaled Dot-Product Attention (SDPA)."""
@@ -225,6 +225,10 @@ def saint_fit_eval(
             f"    [SAINT] Epoch {epoch+1:02d}/10 | Loss: {avg_loss:.4f} | {metric_name}: {val_score:.5f} (Best: {max(best_score, val_score):.5f})",
             flush=True,
         )
+        log_epoch(epoch + 1,
+                  {"train/loss": avg_loss, "val/score": val_score,
+                   "val/best_score": max(best_score, val_score)},
+                  phase=f"saint[{kind}]")
 
         if val_score > best_score:
             best_score = val_score
@@ -235,7 +239,7 @@ def saint_fit_eval(
             if patience_counter >= patience:
                 break
 
-    save_path = os.path.join(model_dir, f"saint_{kind}_{exp_tag}_{split}.pt")
+    save_path = model_path(exp_tag, "saint", kind, split, ".pt")
     torch.save(model.state_dict(), save_path)
 
     if best_weights is not None:

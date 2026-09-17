@@ -333,8 +333,185 @@ Full 2025 = 106.1M jobs; Jan+Feb subset (17.4M jobs, 344 files, 21.9 GB) used fo
 - **Failure drivers:** failure rate rises with requested memory/lifetime and with `NumJobStarts`
   (restarts); exit code 1 (art/framework) dominates non-zero codes.
 
+## 13. Distributional fits (FermiGrid, Feb–Aug 2025)
+
+Two generative fits on the anonymised extract. Both are on FermiGrid only (87.98% of
+executed workload) and exclude GlideinWMS pilots (`Cmd == ./glidein_startup.sh`).
+Notebook: `scripts/notebooks/data-analysis.ipynb`, cells `fitsite1` and `fgmix`.
+
+### 13.1 Inter-failure intervals — two-component exponential
+
+6,074,133 intervals; 3,515,718 zero-length dropped (57.9%); 300,153 in the [10, 300] s
+fit window. Model `c + b·exp(−t/λ₂) + a·exp(−t/λ)`, scipy `curve_fit` (TRF, Poisson
+weights, errors scaled by √(χ²/ndof)):
+
+| parameter | value | ± | t | p |
+| --- | --- | --- | --- | --- |
+| a | 4,799.34 | 146.66 | 32.73 | 1.6e-98 |
+| b | 69,535.60 | 1,614.37 | 43.07 | 8.5e-127 |
+| λ₂ (fast) | 7.7514 s | 0.1109 | 69.90 | 2.0e-181 |
+| λ (slow) | 37.9573 s | 0.5560 | 68.27 | 1.2e-178 |
+| c | 37.53 | 1.44 | 26.00 | 3.3e-77 |
+
+**χ²/ndof = 3.88** (χ² = 1,106.1, ndof = 285). Two time constants, **7.75 s** and
+**37.96 s** (rates 0.129 and 0.0263 s⁻¹), plus a constant floor. A cross-check on raw
+elapsed time moves no parameter by more than 0.002%. Failures are an arrival process,
+which a mixture of exponentials fits naturally.
+
+### 13.2 Queue wait — three-component lognormal mixture
+
+48,998,479 jobs with wait > 0; 1,204,319 (2.46%) above a 1-day cap treated as outliers;
+**47,794,160 workflow jobs fitted**. The same two-exponential form used for failure
+intervals gives χ²/ndof ≈ 104 here — waits are a queueing *outcome*, not an arrival
+process, so the functional form does not transfer.
+
+| component | weight | median | σ (log) | reading |
+| --- | --- | --- | --- | --- |
+| 0 | 0.167 | 28 s | 1.566 | matched into an already-idle pilot slot |
+| 1 | 0.450 | 779 s (13.0 min) | 1.073 | waiting for an occupied slot to turn over |
+| 2 | 0.383 | 8,988 s (2.50 h) | 1.064 | waiting for new pilot provisioning |
+
+KS = **0.0081** vs **0.0500** for a single lognormal. BIC sweep over k = 1…8:
+
+```
+ k          BIC       dBIC       KS
+ 1    2,256,260              0.0500
+ 2    2,217,773    -38,487   0.0192
+ 3    2,207,860     -9,913   0.0081
+ 4    2,206,092     -1,768   0.0092
+ 5    2,204,452     -1,641   0.0074
+ 6    2,202,254     -2,198   0.0072
+ 7    2,201,115     -1,139   0.0069
+ 8    2,201,149         34   0.0069
+```
+
+**k = 3 is chosen at the BIC elbow, not at the BIC minimum** (which is k = 7). With a
+500k fit sample the complexity penalty (ln n ≈ 13/parameter) is negligible against the
+likelihood gain, so BIC keeps buying components that chase the truncation edge; ΔBIC
+collapses from −38k to ~−1.7k per step after k = 3 and KS stops moving. The sweep is
+printed by the cell so the choice is auditable rather than asserted.
+
+Fit quality across the axis: obs/exp is **1.003 at the median bin**, 0.790 at the first
+and **1.614 at the last** — the mixture's right tail falls faster than the data's. That
+last-bin excess is not a cap artifact: only 25 jobs sit at exactly 86,400 s, no value in
+that bin repeats more than ~165 times, and the distribution continues smoothly past the
+cap (42,417 jobs in the next hour). It is a real limitation of the lognormal tail, and
+part of why BIC wanted more components.
+
+### 13.3 What the wait fit implies for E2
+
+- **Log wait is unimodal**, not trimodal: one mode at 1,310 s, no valleys, component
+  separations of only 2.35σ and 1.85σ (bimodality needs ≳2σ). A hard mixture-of-experts
+  router would therefore buy nothing. The problem is variance, not multimodality.
+- **Variance decomposition:** log-space total 5.337 (sd 2.310), within-component 1.361
+  (sd 1.167), **between-component share 0.745**. Knowing a job's regime would leave a
+  conditional sd of ~1.17 in log space. Caveat: this share rises mechanically with k
+  (0.75 at k=3, 0.89 at k=5, 0.96 at k=8), so it is a property of *this* decomposition,
+  not a physical ceiling.
+- **A point estimate is the wrong output object.** With that residual spread the honest
+  deliverable is an interval; `e2dist` adds quantile and AFT heads.
+- **Reference floor.** The best possible *constant* prediction scores within-2x ≈ 0.25.
+  Current models span 0.266–0.297 and R²_log ≈ 0.267 (CatBoost best), so every feature
+  in `Xsub` is currently worth at most ~+0.05 within-2x over a single number. E2 now
+  prints two no-feature reference predictors before the model numbers, because the model
+  figures are not interpretable without that floor.
+- **Error bins are now the fitted regimes.** Component dominance crosses at **106 s** and
+  **2,857 s**, rounded to 2 min and 45 min, giving `inst` / `turn` / `prov` / `park`
+  (>1 d) in `reg_metrics` — replacing the hand-picked <10 m / 10 m–2 h / >2 h bins.
+
+## 14. Dataset accounting and provenance (verified 2026-09-17)
+
+Measured on the 340-column extract at `/media/storage0/allison/BatchSystem-2025`,
+Feb 1 – Aug 31 2025 (212 days). Several figures in the paper were wrong and are corrected
+in `paper/02_related_work.tex` (`tab:datasets`) and `paper/03_methodology.tex`
+(`tab:accounting`).
+
+| quantity | value | previously reported |
+| --- | --- | --- |
+| queue records | 64,088,358 | 64,025,075 |
+| GlideinWMS pilots | 5,145,404 (8.03%) | not separated |
+| workflow jobs | 58,942,954 | — |
+| never started | 2,837,833 (4.43%) | — |
+| started at least once | 56,105,121 | — |
+| named sites | **43** | 45 |
+| telemetry fields | **340** | 475 |
+| size | 15.6 GB (Parquet/zstd) | 80.9, units unstated |
+| users / batches | 395 / 20,110,451 | 395 / 20.07M |
+
+- **Federation is highly concentrated.** Of 56,071,537 workflow runs with a named site,
+  FermiGrid carries 49,333,440 (**87.98%**) and the 42 remaining sites 6,738,097 (12.02%).
+  A 44th site level is the null site: pilots and scheduler-universe jobs that never match.
+- **Pilots are defined by `Cmd == ./glidein_startup.sh`**, not by `group_opportunistic`.
+  The group proxy is wrong in both directions — it misses 30,324 real pilots and wrongly
+  claims 10,424 non-pilots. **No pilot carries a matched site** (0 of 5,209,738 across all
+  71.2M raw rows), so any site-sliced statistic excludes them by construction.
+- **Label revision moved the fault split.** Under the revised rules (SIGTERM from
+  `condor_rm` is no longer hardware evidence) the failed population is 8,025,995 with
+  **6.52% hardware** (523,281) / 93.48% payload (7,502,714), against 8.35% before.
+- **Boundary-job effect measured.** Splitting on label-observation time rather than
+  submission time moves **22,370 jobs, 0.052%** of the training set. The previously
+  reported 125,525 was not reproducible. This directly answers R2 and shows Δ cannot be a
+  boundary artifact.
+
+### 14.1 Wait-time semantics (checked, not assumed)
+
+- `wait_s = JobStartDate − QDate` is **already per-submission**. `JobStartDate` is the
+  *first* start, not the latest: across all 1,247,639 multi-start jobs
+  `JobStartDate < JobCurrentStartDate`, never equal. Restarts (1.25M of 62.6M, 2.0%) do
+  not inflate it. Had it been the latest start the tail would have been badly wrong —
+  median wait to first start is 3,665 s vs 23,403 s to last match on rematched jobs.
+- **Holds contribute nothing**: `NumSystemHolds > 0` on 0 of 54,014,638 FermiGrid jobs in
+  the (0, 1 d] window.
+
+### 14.2 Pilot → payload mapping is not available
+
+Every payload-side `MATCH_GLIDEIN_*` identity field is the literal string `"Unknown"`
+and pilot-side `GlideinName` is the constant `'gfactory_instance'`, so the intended
+`MATCH_GLIDEIN_ClusterId` ↔ pilot `ClusterId` join is unpopulated. Only `LastRemoteHost`
+is shared, and it is present on just 850,018 of 5,209,738 pilots (16%), needing a
+hostname + time-interval join. It would not help E2 regardless: which pilot a payload
+landed in is known only *after* the match, and the match is the event E2 predicts the
+time until. The useful version is aggregate pilot supply at `QDate`, which needs no join.
+
+## 15. Current direction
+
+1. **E2 as an interval predictor.** `e2dist` with `--head quantile` (multi-quantile
+   XGBoost) or `--head aft` (`survival:aft`, normal loss = conditional lognormal, and the
+   only head that can consume never-ran jobs as right-censored). AFT quantiles are built
+   from the *residual* sd, not `aft_loss_distribution_scale` — that hyperparameter is not
+   a fitted spread, and using it gave 0.58 coverage against a nominal 0.80.
+2. **Reference floors and regime-stratified error** in every E2 report.
+3. **Cold start / subgroups** as post-hoc analysis over saved predictions
+   (`eval.helper.cold_start_report`), not a pipeline flag: seen vs never-seen entities on
+   the same test period and the same fitted model, which is a cleaner memorization probe
+   than the random-vs-temporal gap.
+4. **Uncertainty**: `--seeds` reports mean ± sd grouped by split; `--cutoff` reruns the
+   temporal protocol at several dates, with results keyed by cutoff so sweeps accumulate.
+5. **Split basis is fixed**, not configurable — always label-observation time.
+6. **W&B tracking** for the 2-split × N-model × 3-task grid (`config/wandb.yaml`).
+
 ## Changelog
 
+- **2026-09-17** — **Distributional fits + dataset re-accounting.** Added §13–15. Fitted the
+  FermiGrid inter-failure intervals (two-component exponential, λ 7.75 s / 37.96 s,
+  **χ²/ndof 3.88**) and the queue wait (**3-component lognormal**, medians 28 s / 779 s /
+  2.50 h, KS 0.0081 vs 0.0500 for a single lognormal, k chosen at the BIC elbow not the
+  minimum). The wait fit drove three pipeline changes: error bins re-cut to the fitted
+  regime crossovers (106 s, 2,857 s → `inst`/`turn`/`prov`/`park`), no-feature reference
+  predictors printed before every E2 result (a constant already scores within-2x 0.25),
+  and distributional heads (`e2dist`, quantile + AFT). Re-measured the dataset against the
+  new 340-column extract and corrected the paper: **43 named sites (not 45)**, 340
+  telemetry fields (not 475), 64,088,358 records, FermiGrid **87.98%** of sited runs.
+  Pilots are now defined by `Cmd == ./glidein_startup.sh` (the `group_opportunistic` proxy
+  was wrong by ~41k jobs both ways) and carry no site at all. The boundary-job effect is
+  **22,370 jobs (0.052%)**, replacing an unreproducible 125,525. Confirmed `wait_s` is
+  already per-submission (`JobStartDate` is the first start, verified on all 1,247,639
+  multi-start jobs) and that holds inflate no waits (0 of 54M). Pilot→payload joins are
+  unavailable (`MATCH_GLIDEIN_*` is literally `"Unknown"`). Infrastructure: W&B logging
+  with per-epoch curves, `--seeds`/`--cutoff` for variance and sensitivity, cold-start
+  moved to post-hoc, `--split-basis` removed (label-observation is now unconditional), and
+  all model/data/prediction paths centralised in `eval/paths.py` as
+  `models/<experiment>/<model>/` on scratch.
 - **2026-08-02 (b)** — **Multi-scale trailing windows.** Added a 15-minute window alongside the
   1-hour one for all six trailing rates (`TRAIL_WINDOWS = [900, 3600]` knob in B1; `Xmatch`
   40→46 cols, names `trail15m_*` / `trail60m_*`). Rationale: failures are bursty and busy keys

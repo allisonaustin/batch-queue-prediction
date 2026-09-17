@@ -9,9 +9,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from eval.helper import _empty_gpu, _get_slice
+from eval.wandb_logger import log_epoch
+from eval.paths import model_path
 
-model_dir = "/mnt/scratch/fast0/amaustin/dl-tabular-models"
-os.makedirs(model_dir, exist_ok=True)
 
 
 class VectorizedTokenizer(nn.Module):
@@ -210,6 +210,10 @@ def ft_fit_eval(
             f"    [FT-Transformer] Epoch {epoch+1:02d}/10 | Loss: {avg_loss:.4f} | {metric_label}: {val_score:.5f} (Best: {max(best_score, val_score):.5f})",
             flush=True,
         )
+        log_epoch(epoch + 1,
+                  {"train/loss": avg_loss, "val/score": val_score,
+                   "val/best_score": max(best_score, val_score)},
+                  phase=f"ft[{kind}]")
 
         if val_score > best_score:
             best_score = val_score
@@ -225,7 +229,7 @@ def ft_fit_eval(
     if best_weights is not None:
         model.load_state_dict(best_weights)
 
-    save_path = os.path.join(model_dir, f"ft_{kind}_{exp_tag}_{split}.pt")
+    save_path = model_path(exp_tag, "ft", kind, split, ".pt")
     torch.save(model.state_dict(), save_path)
 
     model.eval()

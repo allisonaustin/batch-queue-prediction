@@ -4,10 +4,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from eval.helper import _empty_gpu, _get_slice, _nfeat
+from eval.wandb_logger import log_epoch
+from eval.paths import model_path
 
 MLP_EPOCHS, MLP_BS, MLP_LR, MLP_EMB_CAP = 2, 16384, 1e-3, 32
-model_dir = "/mnt/scratch/fast0/amaustin/dl-tabular-models"
-os.makedirs(model_dir, exist_ok=True)
 
 class MLP(nn.Module):
     """Standard Feedforward Neural Network (MLP) with Categorical Embeddings."""
@@ -154,9 +154,12 @@ def mlp_fit_eval(
             f"    mlp[{kind}] epoch {ep + 1}/{MLP_EPOCHS} mean loss {tot / max(nb_, 1):.4f}",
             flush=True,
         )
+        # Per-epoch curve for W&B. No-op unless a run is active, so this stays
+        # runnable with wandb absent.
+        log_epoch(ep + 1, {"train/loss": tot / max(nb_, 1)}, phase=f"mlp[{kind}]")
 
     if split is not None:
-        save_path = os.path.join(model_dir, f"mlp_{kind}_{exp_tag}_{split}.pt")
+        save_path = model_path(exp_tag, "mlp", kind, split, ".pt")
         torch.save(net.state_dict(), save_path)
 
     net.eval()

@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score
 
 from eval.helper import _empty_gpu, _get_slice
+from eval.wandb_logger import log_epoch
 
 
 class TabR(nn.Module):
@@ -129,6 +130,10 @@ def tabr_fit_eval(
             f"    [TabR] Epoch {epoch+1:02d}/15 | Loss: {avg_loss:.4f} | Val AUC: {val_auc:.5f} (Best: {max(best_auc, val_auc):.5f})",
             flush=True,
         )
+        log_epoch(epoch + 1,
+                  {"train/loss": avg_loss, "val/auc": val_auc,
+                   "val/best_auc": max(best_auc, val_auc)},
+                  phase=f"tabr[{kind}]")
         if val_auc > best_auc:
             best_auc = val_auc
             patience_counter = 0

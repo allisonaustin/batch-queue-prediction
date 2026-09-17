@@ -23,22 +23,28 @@ A benchmarking and evaluation suite for evaluating tree-based models and deep ta
 ```
 fife-batch-jobs/
 ├── scripts/
-│   ├── vis/						# Data explorer visualization
 │   ├── eval/
-│   │   ├── harness.py              # Main CLI evaluation harness
-│   │   └── helper.py               # Model loaders, metrics, and prediction routines
-│   ├── train/                      # Model implementations
-│   ├── output/                     # Evaluation metrics and feature importance output JSONs
-│   ├── data-explorer.ipynb  		# Job data visualization app example (work in progress)
-│   ├── data-analysis.ipynb  		# Initial job data analysis
-	├── feat-engineering.ipynb  	# Training and testing setup for job prediction tasks
-	└── pred-analysis.ipynb         # Job prediction result visualizations
-├── .gitignore                      # Dataset and runtime configuration
-├── CLAUDE.md                       # Global instructions for Claude          
-├── FIFE-Docs.md                    # FIFE Batch Queue data documentation          
-├── MODELING.md                     # Detailed modeling design notes
-├── README.md                       # Repo info
-└── config.json						# Dataset and runtime configuration
+│   │   ├── harness.py              		# Main CLI evaluation harness
+│   │   └── helper.py               		# Model loaders, metrics, and prediction routines
+│   ├── output/                     		# Evaluation metrics and feature importance output JSONs
+|   ├── notebooks/
+|   |    ├── data-explorer.ipynb    		# Job data visualization app example (work in progress)
+|   |    ├── data-analysis.ipynb    		# Initial job data analysis
+|   |    ├── feat-engineering.ipynb 		# Training and testing setup for job prediction tasks
+|   |    ├── pred-analysis.ipynb    		# Job outcome prediction results
+|   |    ├── wait_time_regresssion.ipynb	# Queue wait time prediction results
+│   ├── results/                      		# Job prediction results (JSON format)
+│   ├── train/                      		# Model implementations
+│   ├── vis/								# Data explorer visualization
+│   ├── config/
+│   │    └── wandb.yaml.example				# Copy to wandb.yaml and fill in (gitignored)
+|   ├── run_sweep.sh						# Full sweep: all models x both splits x all tasks
+├── .gitignore                      		# Dataset and runtime configuration
+├── CLAUDE.md                       		# Global instructions for Claude  
+├── FIFE-Docs.md                    		# FIFE Batch Queue data documentation  
+├── MODELING.md                     		# Detailed modeling design notes
+├── README.md                       		# Repo info
+└── config.json								# Dataset and runtime configuration
 ```
 
 ### Requirements
@@ -69,6 +75,22 @@ TBD
 
 ##### Structure
 
+Paths resolve through `scripts/eval/paths.py` and each root takes an environment
+override: `FIFE_DATA_ROOT` (feature matrices and targets, default fast local NVMe),
+`FIFE_MODEL_ROOT` (saved models, default bulk storage), `FIFE_PRED_ROOT` (saved test
+predictions). Data stays on scratch because training mmaps tens of GB out of it
+repeatedly; `/media/storage0` is NFS and would be far slower.
+
+Saved models are laid out one directory per experiment and model, with the seed in
+the filename so seeds no longer overwrite each other:
+
+```
+models/
+├── e1/xgboost/xgboost_bin_temporal_s42.json
+├── e2/lightgbm/lightgbm_reg_random_s0.txt
+└── e3/saint/saint_bin_temporal_s1.pt
+```
+
 - `Xmatch.npy` & `Xsub.npy`: feature matrices (match-time and submit-time features)
 - `failed.npy`: finary failure target labels
 - `wait_sv.npy`: raw queue wait times in seconds
@@ -92,13 +114,102 @@ python scripts/eval/harness.py <experiment> <model> [split]
 - `<model>`: `xgb`, `lgb`, `cat`, `mlp`, `tabnet`, `saint`, `ft`, `tsmixer`, `tabr`, `hierarchical`
 - `[split]`: specify training split protocol (optional) `random`, `temporal`, or `both` (default)
 
+Additional experiments:
+
+- `e2dist` -- queue wait as an *interval* rather than a point estimate (`--head quantile|aft`)
+- `cascade` -- match-time hardware detection composing saved E1 and E3 scores
+
+#### Flags
+
+| Flag                    | Default        | What it does                                                                                                 |
+| ----------------------- | -------------- | ------------------------------------------------------------------------------------------------------------ |
+| `--seed N`            | `42`         | Seeds Python, NumPy and Torch, and suffixes saved models, predictions and result keys.                       |
+| `--seeds 0,1,2,3,4`   | --             | Runs each seed in sequence and prints mean ± std per split at the end. Overrides`--seed`.                 |
+| `--cutoff YYYY-MM-DD` | `2025-07-01` | Deployment cutoff the temporal protocol simulates. Also accepts raw epoch seconds. Parsed as **UTC**. |
+
+**Seeding.** `--seed` is the only source of run-to-run randomness: it seeds Python's`random`passed to every model constructor. The train/test *partition* is deliberately not affected -- it is built with `np.random.default_rng`, which is immune to`np.random.seed`, so every seed sees exactly the same data and the spread measures model variance alone. A single seed reports `std 0.0` with `n=1`, which is a placeholder and not evidence of stability; use `--seeds` with at least three values for anything reported as an error bar.
+
+**Cutoffs.** Results are keyed by cutoff when it is not the default, e.g.`temporal__seed7__cut2025-06-01`. Only the temporal protocol depends on the cutoff; the random split has none.
+
+**Split basis.** The temporal split always cuts on when each job's *label became observable*, never on submission time. A job submitted June 28 that finishes July 5 has an outcome that was unknowable at a July 1 cutoff, so cutting on `QDate` would leave a future label in training. It is separate from feature admissibility (`Xsub` vs `Xmatch`), which governs which *columns* exist at prediction time. On this dataset the two bases differ by 22,370 jobs, 0.052% of training.
+
 #### Usage
 
-1. Job failure classification using XGBoost with temporal split:
+Run from `scripts/` with the package on the path:
 
 ```
-python scripts/eval/harness.py e1 xgboost both
+cd scripts
+export PYTHONPATH="$PWD"
 ```
+
+1. Job failure classification using XGBoost, both splits:
+
+```
+python3 -m eval.harness e1 xgboost both
+```
+
+2. Five seeds, logged to W&B:
+
+```
+python3 -m eval.harness e1 xgboost both --seeds 0,1,2,3,4 --wandb
+```
+
+3. Cutoff sensitivity -- same protocol, different deployment date:
+
+```
+python3 -m eval.harness e1 xgboost temporal --cutoff 2025-06-01
+python3 -m eval.harness e1 xgboost temporal --cutoff 2025-08-01
+```
+
+### Running the full sweep
+
+`scripts/run_sweep.sh` runs every model across both splits for E1/E2/E3, then the interval heads, the cutoff-sensitivity runs and the cascade. Logs land in
+`scripts/logs/sweep_seed<seed>_<timestamp>/`, one file per cell, and a one-line summary of each is echoed as it finishes.
+
+```
+cd scripts
+./run_sweep.sh                                   # seed 42, default cutoff
+SEEDS=0,1,2,3,4 ./run_sweep.sh                   # multi-seed error bars
+CUTOFFS=2025-06-01,2025-08-01 ./run_sweep.sh     # add cutoff sensitivity
+WANDB=0 ./run_sweep.sh                           # no logging
+WANDB_MODE=offline ./run_sweep.sh                # log locally, sync later
+```
+
+| Variable          | Default                              | Meaning                                                                                                                                              |
+| ----------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SEEDS`         | `42`                               | Comma-separated seeds. The first is the "primary" seed used for single-seed stages (cascade, cutoff sweep).                                          |
+| `CUTOFFS`       | `2025-06-01,2025-07-01,2025-08-01` | Cutoffs for the sensitivity stage.`2025-07-01` is skipped there because the main sweep already covers it.                                          |
+| `CUTOFF_MODELS` | `xgboost lightgbm`                 | Models used for cutoff sensitivity. Kept small on purpose -- this answers "is the gap an artifact of one cutoff", which does not need the full grid. |
+| `WANDB`         | `1`                                | `0` disables logging entirely.                                                                                                                     |
+| `WANDB_MODE`    | unset                                | `offline` writes to `wandb/` for a later `wandb sync`.                                                                                         |
+
+The sweep must be run **after** the feature pipeline has been regenerated; see the notebook order in `scripts/notebooks/` (`data-analysis.ipynb` -> `feat-engineering.ipynb`)
+
+### Experiment tracking (Weights & Biases)
+
+Logging is **off by default** and the code runs unchanged without `wandb` installed.
+
+**Setup** -- one file, copied once. `config/wandb.yaml` is gitignored:
+
+```
+cd scripts
+cp config/wandb.yaml.example config/wandb.yaml     # fill in entity + api_key
+python3 -m eval.harness e1 xgboost both --wandb
+```
+
+If you already ran `wandb login` or set `WANDB_API_KEY`, leave `api_key` blank. Blank
+keys fall back to the defaults in `eval/wandb_logger.py`.
+
+Override order: CLI > environment (`WANDB_PROJECT`, `WANDB_ENTITY`, `WANDB_MODE`,
+`WANDB_API_KEY`) > `config/wandb.yaml`. `--no-wandb` overrides everything.
+
+One run per *(experiment, model, split, seed)*, named `e1-xgboost-temporal-s42` and
+grouped as `e1-xgboost` with `job_type=temporal`, so the random-vs-temporal contrast
+reads as one comparison. Logged: per-epoch loss/validation curves for the neural
+models, final metrics (to history and to the run summary), and feature importance.
+Trees have no epochs -- `--wandb-tree-rounds` adds per-round curves but needs an
+`eval_set` and is scored on a training subsample, not validation. TROUT/`hierarchical`
+wraps LightGBM and reports final metrics only.
 
 ### Metrics
 
@@ -109,9 +220,31 @@ Precision, recall, F1, ROC-AUC, PR-AUC
 ##### Queue wait time
 
 - log1p MAE: mean absolute error evaluated on $log(1 + wait\_time)$
-- raw MAE (s): ean absolute error converted back to raw seconds
+- raw MAE (s): mean absolute error converted back to raw seconds
 - sMAPE (%): symmetric mean absolute percentage error (bounded between $0\%$ and $200\%$)
 - within-2x ratio: proportion of predictions falling within a factor of 2 of actual wait times
+
+Error is also broken out by **queueing regime**. These bins are not round numbers:
+they are the crossover points of a three-component lognormal mixture fitted to the
+FermiGrid wait distribution (`notebooks/data-analysis.ipynb`, cell `fgmix`), where one
+component overtakes the next at 106 s and 2,857 s.
+
+| Key      | Range           | Mechanism                                     |
+| -------- | --------------- | --------------------------------------------- |
+| `inst` | < 2 min         | matched into an already-idle pilot slot       |
+| `turn` | 2 min -- 45 min | waiting for an occupied slot to turn over     |
+| `prov` | 45 min -- 1 day | waiting for new pilot provisioning            |
+| `park` | > 1 day         | parked behind a held workflow or a quota wall |
+
+The older `<10m / 10m-2h / >2h` keys (`mae_10m`, `mae_2h`, `mae_long`) are still
+emitted so entries appended to `results/wait_time_results.json` before this change
+stay comparable; the regime keys are named separately so no existing key silently
+changed meaning.
+
+Two no-feature **reference predictors** are scored on every split and printed before
+the model numbers, because the wait distribution is wide but unimodal in log space and
+a single constant already reaches within-2x ≈ 0.25 -- model numbers are not
+interpretable without that floor.
 
 ### References
 

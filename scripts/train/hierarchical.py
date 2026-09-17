@@ -4,6 +4,7 @@ import numpy as np
 import lightgbm as lgb
 from eval.helper import _get_slice
 import joblib
+from eval.paths import model_path
 
 class Hierarchical:
     """
@@ -102,7 +103,6 @@ class Hierarchical:
             return self.global_model.feature_importances_
         return None
 
-model_dir = "/mnt/scratch/fast0/amaustin/dl-tabular-models/"
 
 def hierarchical_fit_eval(
     parts,
@@ -152,7 +152,7 @@ def hierarchical_fit_eval(
     model.fit(Xtr_np, ya[tri], n_cat=n_cat)
 
     save_path = os.path.join(
-        model_dir, f"hierarchical_{kind}_{exp_tag}_{split}.joblib"
+        model_path(exp_tag, "hierarchical", kind, split, ".joblib")
     )
     joblib.dump(model, save_path)
     print(f"--> Saved Hierarchical model to {save_path}", flush=True)

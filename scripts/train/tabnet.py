@@ -4,9 +4,10 @@ import numpy as np
 import torch
 from eval.helper import _empty_gpu, _get_slice
 from pytorch_tabnet.tab_model import TabNetClassifier, TabNetRegressor
+from eval.wandb_logger import log_epoch
+from pytorch_tabnet.callbacks import Callback
+from eval.paths import model_path
 
-model_dir = "/mnt/scratch/fast0/amaustin/dl-tabular-models"
-os.makedirs(model_dir, exist_ok=True)
 
 
 def tabnet_fit_eval(
@@ -70,12 +71,24 @@ def tabnet_fit_eval(
         clf = TabNetClassifier(**tabnet_params)
         eval_metric = ["auc"]
 
+    # TabNet owns its training loop, so the per-epoch W&B curve comes from a
+    # callback rather than an inline hook. pytorch_tabnet hands each callback the
+    # epoch's logs dict, which already carries the train loss and every eval_metric.
+    class _WandbEpoch(Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            log_epoch(epoch + 1,
+                      {f"train/{k}" if k == "loss" else f"val/{k}": v
+                       for k, v in (logs or {}).items()
+                       if isinstance(v, (int, float))},
+                      phase=f"tabnet[{kind}]")
+
     clf.fit(
         X_train=Xtr_np,
         y_train=y_tr,
         eval_set=[(X_eval_sub, y_eval_sub)],
         eval_name=["test"],
         eval_metric=eval_metric,
+        callbacks=[_WandbEpoch()],
         max_epochs=10,
         patience=3,
         batch_size=16384,
@@ -86,7 +99,7 @@ def tabnet_fit_eval(
         compute_importance=False,
     )
 
-    save_path = os.path.join(model_dir, f"tabnet_{kind}_{exp_tag}_{split}")
+    save_path = model_path(exp_tag, "tabnet", kind, split)
     clf.save_model(save_path)
     print(f"--> Generating predictions for test splits... | split={split}", flush=True)
 

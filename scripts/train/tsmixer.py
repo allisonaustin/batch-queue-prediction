@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from eval.helper import _empty_gpu, _get_slice
+from eval.wandb_logger import log_epoch
+from eval.paths import model_path
 
 
 class Block(nn.Module):
@@ -105,7 +107,6 @@ def tsmixer_fit_eval(
     trs=None,
     want_imp=False,
     split=None,
-    model_dir="/mnt/scratch/fast0/amaustin/dl-tabular-models",
     is_regression=False,
     exp_tag=None,
 ):
@@ -211,6 +212,10 @@ def tsmixer_fit_eval(
             f"    [TSMixer] Epoch {epoch+1:02d}/10 | Loss: {avg_loss:.4f} | {metric_label}: {val_score:.5f} (Best: {max(best_score, val_score):.5f})",
             flush=True,
         )
+        log_epoch(epoch + 1,
+                  {"train/loss": avg_loss, "val/score": val_score,
+                   "val/best_score": max(best_score, val_score)},
+                  phase=f"tsmixer[{kind}]")
 
         if val_score > best_score:
             best_score = val_score
@@ -225,8 +230,7 @@ def tsmixer_fit_eval(
         model.load_state_dict(best_weights)
 
     # Save trained model to disk
-    os.makedirs(model_dir, exist_ok=True)
-    save_path = os.path.join(model_dir, f"tsmixer_{kind}_{exp_tag}_{split}.pt")
+    save_path = model_path(exp_tag, "tsmixer", kind, split, ".pt")
     torch.save(model.state_dict(), save_path)
     print(f"    [TSMixer] Saved checkpoint to {save_path}", flush=True)
 
