@@ -216,14 +216,19 @@ WAIT_MIX = {
     "n": 47_794_160,
 }
 
-# Error-reporting strata, cut at the points where one mixture component overtakes
-# the next (106 s and 2,857 s, rounded to 2 min and 45 min) rather than at the
-# round numbers used before. Each stratum is a distinct queueing regime:
+# Error-reporting strata. The first three edges come from the fitted mixture, cut
+# where one component overtakes the next (106 s and 2,857 s, rounded to 2 min and
+# 45 min); k = 3 components give exactly these three regions:
 #   inst -- matched into an already-idle pilot slot
 #   turn -- waiting for a slot to turn over
 #   prov -- waiting for new pilot provisioning
-#   park -- beyond the 1 d cap; parked behind a held workflow or a quota wall,
-#           kept as its own stratum rather than dropped so nothing is hidden
+#
+# `park` is NOT a fourth regime. It is everything beyond the 1 d cap applied to the
+# fit's population (2.46% of jobs), so the fit says nothing about it -- the observed
+# distribution runs smoothly through the cap (no pile-up at 86,400 s; 42,417 jobs in
+# the following hour). It is reported separately rather than folded into `prov`
+# because its errors are ~20x larger (MAE 229,689 s vs 10,920 s), so pooling would
+# let ~2% of jobs dominate the regime that matters.
 WAIT_REGIMES = (
     ("inst", 0.0, 120.0),
     ("turn", 120.0, 2_700.0),

@@ -23,6 +23,8 @@ A benchmarking and evaluation suite for evaluating tree-based models and deep ta
 ```
 fife-batch-jobs/
 ├── scripts/
+│   ├── config/
+│   │    └── wandb.yaml.example				# Copy to wandb.yaml and fill in
 │   ├── eval/
 │   │   ├── harness.py              		# Main CLI evaluation harness
 │   │   └── helper.py               		# Model loaders, metrics, and prediction routines
@@ -36,8 +38,7 @@ fife-batch-jobs/
 │   ├── results/                      		# Job prediction results (JSON format)
 │   ├── train/                      		# Model implementations
 │   ├── vis/								# Data explorer visualization
-│   ├── config/
-│   │    └── wandb.yaml.example				# Copy to wandb.yaml and fill in (gitignored)
+|   ├── load.py								# Module to load/process the job logs
 |   ├── run_sweep.sh						# Full sweep: all models x both splits x all tasks
 ├── .gitignore                      		# Dataset and runtime configuration
 ├── CLAUDE.md                       		# Global instructions for Claude  
@@ -121,11 +122,11 @@ Additional experiments:
 
 #### Flags
 
-| Flag                    | Default        | What it does                                                                                                 |
-| ----------------------- | -------------- | ------------------------------------------------------------------------------------------------------------ |
-| `--seed N`            | `42`         | Seeds Python, NumPy and Torch, and suffixes saved models, predictions and result keys.                       |
-| `--seeds 0,1,2,3,4`   | --             | Runs each seed in sequence and prints mean ± std per split at the end. Overrides`--seed`.                 |
-| `--cutoff YYYY-MM-DD` | `2025-07-01` | Deployment cutoff the temporal protocol simulates. Also accepts raw epoch seconds. Parsed as **UTC**. |
+| Flag                    | Default        | What it does                                                                                               |
+| ----------------------- | -------------- | ---------------------------------------------------------------------------------------------------------- |
+| `--seed N`            | `42`         | Seeds Python, NumPy and Torch, and suffixes saved models, predictions and result keys.                     |
+| `--seeds 0,1,2,3,4`   | --             | Runs each seed in sequence and prints mean ± std per split at the end. Overrides`--seed`.               |
+| `--cutoff YYYY-MM-DD` | `2025-07-01` | Deployment cutoff the temporal protocol simulates. Also accepts raw epoch seconds. Parsed as**UTC**. |
 
 **Seeding.** `--seed` is the only source of run-to-run randomness: it seeds Python's`random`passed to every model constructor. The train/test *partition* is deliberately not affected -- it is built with `np.random.default_rng`, which is immune to`np.random.seed`, so every seed sees exactly the same data and the spread measures model variance alone. A single seed reports `std 0.0` with `n=1`, which is a placeholder and not evidence of stability; use `--seeds` with at least three values for anything reported as an error bar.
 
@@ -234,7 +235,12 @@ component overtakes the next at 106 s and 2,857 s.
 | `inst` | < 2 min         | matched into an already-idle pilot slot       |
 | `turn` | 2 min -- 45 min | waiting for an occupied slot to turn over     |
 | `prov` | 45 min -- 1 day | waiting for new pilot provisioning            |
-| `park` | > 1 day         | parked behind a held workflow or a quota wall |
+| `park` | > 1 day         | beyond the fitted range (not a regime; see below) |
+
+The first three bins are the mixture's component crossovers -- k = 3 gives exactly
+three regions. `park` is not a fourth component: it is everything past the 1 d cap
+applied to the fit's population, reported separately only so that ~2% of jobs with
+~20x larger errors cannot dominate the `prov` statistic.
 
 The older `<10m / 10m-2h / >2h` keys (`mae_10m`, `mae_2h`, `mae_long`) are still
 emitted so entries appended to `results/wait_time_results.json` before this change

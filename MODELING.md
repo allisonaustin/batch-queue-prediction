@@ -415,9 +415,120 @@ part of why BIC wanted more components.
   in `Xsub` is currently worth at most ~+0.05 within-2x over a single number. E2 now
   prints two no-feature reference predictors before the model numbers, because the model
   figures are not interpretable without that floor.
-- **Error bins are now the fitted regimes.** Component dominance crosses at **106 s** and
-  **2,857 s**, rounded to 2 min and 45 min, giving `inst` / `turn` / `prov` / `park`
-  (>1 d) in `reg_metrics` — replacing the hand-picked <10 m / 10 m–2 h / >2 h bins.
+- **Error bins are now the fitted regimes.** Component dominance crosses at **106 s**
+  and **2,857 s**, rounded to 2 min and 45 min. k = 3 components give exactly three
+  regions — `inst` / `turn` / `prov` — replacing the hand-picked <10 m / 10 m–2 h /
+  >2 h bins. A fourth reporting row, `park` (>1 d), is **not** a fitted component: it
+  is everything past the 1 d cap applied to the fit's population, about which the fit
+  says nothing. The data runs smoothly through that cap (25 jobs at exactly 86,400 s,
+  42,417 in the following hour), so the cap is a modelling choice rather than a
+  boundary in the workload. It is kept as its own row only because its errors are
+  ~20× larger (MAE 229,689 s vs 10,920 s in `prov`), and pooling would let ~2% of
+  jobs dominate the regime that matters.
+
+### 13.4 Trailing windows, chosen per key
+
+The failure fit sets the timescale trailing health features should be measured on.
+But the fit is **site-level**, and that does not transfer: each key has its own
+arrival process, so each was fitted separately (same form, same [10, 300] s range,
+same procedure).
+
+| key | λ₂ (fast) | λ (slow) | χ²/ndof | median gap |
+| --- | --- | --- | --- | --- |
+| site | 7.75 s | 37.96 s | 3.88 | 1 s |
+| campaign | 8.04 s | 45.79 s | 4.53 | — |
+| **node** | **fit fails** | **fit fails** | **1449** | **415 s** |
+
+**Site and campaign** cluster on tens of seconds. A trailing window's value is the
+ratio of clustered excess to steady background inside it,
+
+    burst(W) = a·λ·(1 − e^(−W/λ)) + b·λ₂·(1 − e^(−W/λ₂)),   bg(W) = c·W
+
+which falls monotonically with W:
+
+| W | 60 s | 120 s | 300 s | 900 s | 3600 s |
+| --- | --- | --- | --- | --- | --- |
+| site burst/bg | 304 | 158 | 64 | 21 | 5 |
+| campaign burst/bg | 86 | 46 | 19 | 6 | 2 |
+| fraction of slow burst captured | 79% | 96% | 100% | 100% | 100% |
+
+Past ~120 s the window already holds the whole burst, so longer windows add
+background and nothing else. 300 s and 900 s are dropped — identical coverage to
+120 s at 4.7× and 14× worse signal-to-background. What remains is 60 s (burst) and
+3600 s (the fit's constant term `c`, i.e. slow drift).
+
+**Node is a different process entirely and the two-exponential form does not fit it
+at any range.** Over the site's [10, 300] s the fit degenerates outright (λ₂ = −1.0e6
+± 1.9e8 s, negative amplitudes, χ²/ndof 1449). A scan of candidate ranges puts the
+best two-exponential at [60, 3600] s — λ₂ = 60.56 ± 0.70 s, λ = 703.0 ± 19.9 s — and
+it is still rejected at **χ²/ndof = 80.2**, against 3.88 for the site fit on the same
+functional form (figure: `output/interfailure_fit_node_FermiGrid.pdf`, notebook cell
+`cded44c7`).
+
+**Exposure.** Unlike FermiGrid as a whole, which is never empty (the site fit removes
+0 s of idle), a single slot is idle between jobs: **57.6% of total within-node gap
+time is idle**, and 41.0% of intervals contain some. Raw elapsed time therefore badly
+overstates node exposure, mostly in the tail — p75 drops 29,952 → 18,330 s and p90
+191,877 → 105,524 s under the correction. A slot is serial, so its active time needs
+no concurrency sweep: it is the total runtime of that slot's jobs in the interval.
+The cell fits active time and cross-checks against raw.
+
+Correcting for it does **not** rescue the fit — χ²/ndof 88.2 on active time against
+80.2 on raw, with the time constants moving ~4% (λ₂ 60.6 → 58.1 s, λ 703.0 → 688.0 s).
+The model fails on the *shape* of the node distribution, not on the choice of time
+measure. The window choice is likewise robust: 3600 s covers 66.2% of active gaps
+against 64.5% of raw ones.
+
+The residuals also show a distinct bump near **1,900–2,100 s** that no smooth
+two-exponential can produce, and it **survives the active-time correction**, so it is
+not an idle artifact. Its cause is not established; a glidein lifetime or retirement
+boundary (`GLIDEIN_ToDie`/`ToRetire`) is the obvious thing to check.
+
+Node failures are ~10⁴ times more spread out — mean gap 76,158 s against 7.2 s at
+site level:
+
+| | p10 | p25 | p50 | p75 | p90 |
+| --- | --- | --- | --- | --- | --- |
+| node gap | 49 s | 86 s | **415 s** | 29,952 s | 191,877 s |
+| site gap | 1 s | 1 s | **1 s** | 3 s | 12 s |
+
+The [10, 300] s fit range covers only the extreme left tail of the node
+distribution, which is why the fit degenerated. A 60 s window contains a prior
+failure on the same node just **15%** of the time, so the site-derived window is the
+wrong instrument for node rates. Node windows are set from the gap distribution
+directly: 3600 s covers 64.5% and 86400 s covers 83.2%.
+
+    TRAIL_WINDOWS_BY_KEY = {
+        "site_fail": [60, 3600],   "site_hw": [60, 3600],   "camp_fail": [60, 3600],
+        "node_fail": [3600, 86400], "node_hw": [3600, 86400],
+    }
+
+Caveat: both distributions are over-dispersed relative to a single exponential
+(CV 8.2 site, 4.0 node), driven by the tail beyond the fit range. The two-exponential
+description is a statement about the burst regime it was fitted on, not the whole
+distribution.
+
+### 13.5 Trailing statistics: measured redundancy
+
+The fits constrain windows, not which key a rate is computed over. That axis was
+measured on the archived 46-column matrix (2M-row sample):
+
+- **`entry_fail` is redundant with `site_fail`** — r = **0.995** (15 m), **0.996**
+  (60 m). GlideinWMS entries nest inside sites, so this is redundancy by
+  construction. Dropped.
+- The same statistic at two windows correlates at r = 0.81–0.93, and the 12 trailing
+  features need only **5 principal components for 90%** of their variance.
+- Univariate |r| with `Failed` (60 m): node_fail 0.586, site_fail 0.540,
+  entry_fail 0.541, camp_fail 0.383. Against `hw` the ordering inverts —
+  **site_hw 0.040 is the largest of all twelve**, node_hw 0.005.
+- **The `*_hw` rates are kept** despite near-zero correlation with `Failed`: they top
+  the hardware column, are small only because hardware faults are 0.8% prevalent, and
+  are the only hardware-specific trailing signal E3 has.
+
+Net: **24 planned trailing columns → 10**; Xmatch 58 → **44 columns**, 14.9 →
+**11.3 GB**. Derived from the fits and a redundancy measurement *before* any model
+trains on the new matrix, so it cannot be a post-hoc rationalisation of one run's
+feature importances.
 
 ## 14. Dataset accounting and provenance (verified 2026-09-17)
 
@@ -492,6 +603,28 @@ time until. The useful version is aggregate pilot supply at `QDate`, which needs
 
 ## Changelog
 
+- **2026-09-18 (b)** — **Per-key trailing windows; load.py de-duplication.** The site fit
+  does not transfer to other trailing keys, so each was fitted separately: campaign
+  matches site (λ 8.04/45.79 s, χ²/ndof 4.53) but **node fails outright** (χ²/ndof 1449,
+  negative amplitudes). Node failures are ~10⁴× more spread out (median gap 415 s vs 1 s),
+  and a 60 s window holds a prior same-node failure only 15% of the time. Windows are now
+  per key: site/campaign [60, 3600], node [3600, 86400], recorded in `schema_meta.json`.
+  Fixed a bug this surfaced: the rate loop was a cross product over all windows × all
+  specs, which with per-key windows would compute 18 rates for 10 named columns and
+  misalign them silently; it is now driven by `TRAIL_PAIRS` with a count assertion.
+  Separately removed duplicated processing between `load.py` and `feat-engineering.ipynb`:
+  the window filter was applied twice from two independent thresholds, and `failed`/`hw`
+  were re-derived from `fault_type` instead of reading load.py's columns. See §13.4–13.5.
+- **2026-09-18** — **Trailing features cut from the fit.** Used the inter-failure fit to
+  choose trailing windows instead of choosing them by hand: the burst/background ratio
+  inside a window falls monotonically with W and the burst is fully contained by ~120 s,
+  so 300 s and 900 s add only background (4.7× and 14× worse SNR than 60 s for identical
+  coverage). `TRAIL_WINDOWS = [60, 3600]` — one burst window, one for the fit's constant
+  term. Separately measured the statistic axis: `entry_fail` duplicates `site_fail`
+  (r = 0.995/0.996, entries nest inside sites) and is dropped; the `*_hw` rates are kept
+  because they carry the largest |r| with the hardware target despite tiny absolute
+  values. `TRAIL_NAMES` 6 → 5. Net 24 → 10 trailing columns, Xmatch 58 → 44, 14.9 → 11.3 GB.
+  See §13.4–13.5.
 - **2026-09-17** — **Distributional fits + dataset re-accounting.** Added §13–15. Fitted the
   FermiGrid inter-failure intervals (two-component exponential, λ 7.75 s / 37.96 s,
   **χ²/ndof 3.88**) and the queue wait (**3-component lognormal**, medians 28 s / 779 s /

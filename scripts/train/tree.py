@@ -31,10 +31,20 @@ def _xgb_cls(spw, seed=42):
         random_state=seed
     )
 
+# Row/column subsampling for the regressors, matching what _sk_cls already does.
+# Two reasons: at 48M rows a tree that sees every row costs far more for little gain
+# (LightGBM took 1,061 s per split against XGBoost's 36 s on GPU), and with no
+# sampling at all `hist` boosting is deterministic -- `random_state` has nothing to
+# act on, so a multi-seed run returns identical fits and a spread of exactly 0.
+_SUBSAMPLE = 0.1        # 10% of rows per tree (~4.8M at this scale)
+_COLSAMPLE = 0.8
+
+
 def _xgb_reg(seed=42):
     return xgb.XGBRegressor(
         tree_method="hist", device=XGB_DEV, n_estimators=200, max_depth=8,
-        learning_rate=0.1, random_state=seed
+        learning_rate=0.1, subsample=_SUBSAMPLE, colsample_bytree=_COLSAMPLE,
+        random_state=seed
     )
 
 # Quantiles the wait-time distributional heads are fitted at. The mixture fit
@@ -147,13 +157,19 @@ def _sk_cls(lib, spw, seed=42):
 
 def _sk_reg(lib, seed=42):
     if lib == "lightgbm":
+        # subsample_freq must be >= 1 or LightGBM ignores subsample entirely.
         return LGBMRegressor(device=LGBM_DEV, n_estimators=200, num_leaves=255, max_depth=8,
-                             learning_rate=0.1, n_jobs=-1, verbose=-1, random_state=seed)
+                             learning_rate=0.1, subsample=_SUBSAMPLE, subsample_freq=1,
+                             colsample_bytree=_COLSAMPLE, n_jobs=-1, verbose=-1,
+                             random_state=seed)
     elif lib == "catboost":
+        # CatBoost's default Bayesian bootstrap ignores `subsample`; Bernoulli takes it.
         kw = dict(task_type=CB_TASK, devices="0", iterations=200, depth=8, learning_rate=0.1,
+              bootstrap_type="Bernoulli", subsample=_SUBSAMPLE, rsm=_COLSAMPLE,
               verbose=False, allow_writing_files=False, random_seed=seed)
         if CB_TASK == "GPU":
             kw["gpu_ram_part"] = 0.5
+            kw.pop("rsm", None)          # rsm is unsupported on CatBoost GPU
         return CatBoostRegressor(**kw)
 
 def _sk_fit(m, Xtr, ytr, sample_weight=None):

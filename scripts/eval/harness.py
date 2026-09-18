@@ -1033,8 +1033,21 @@ if __name__ == "__main__":
     # Compute log-transformed target for wait time regression
     wait_log = np.log1p(np.maximum(wait_sv, 0))
 
-    NCAT_MATCH = globals().get("NCAT_MATCH", None)
-    NCAT_SUB = globals().get("NCAT_SUB", None)
+    # Categorical-column counts come from the feature pipeline's schema_meta.json.
+    # This previously read globals(), which is empty in a fresh process -- so ncat was
+    # always None and the neural trainers treated every column as numeric, losing the
+    # entity embeddings. The globals() lookup is kept as a fallback for notebook use.
+    _meta_path = os.path.join(SAVE_DIR, "schema_meta.json")
+    _SCHEMA = {}
+    if os.path.exists(_meta_path):
+        with open(_meta_path) as _f:
+            _SCHEMA = json.load(_f)
+    else:
+        print(f"[warn] {_meta_path} missing -- ncat falls back to None, which disables "
+              f"categorical embeddings in the neural models.", flush=True)
+    NCAT_MATCH = _SCHEMA.get("NCAT_MATCH", globals().get("NCAT_MATCH", None))
+    NCAT_SUB = _SCHEMA.get("NCAT_SUB", globals().get("NCAT_SUB", None))
+    print(f"ncat: match={NCAT_MATCH} sub={NCAT_SUB}", flush=True)
 
     globals()["CUTOFF_TAG"] = None if args.cutoff == "2025-07-01" else CUTOFF_LABEL
     WB_CFG.setdefault("tags", [])
